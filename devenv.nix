@@ -80,6 +80,14 @@ in
   # https://devenv.sh/git-hooks/
   git-hooks.settings.rust.cargoManifestPath = "./Cargo.toml";
 
+  # Use the same Rust toolchain for git-hooks as for development
+  # This ensures clippy/rustfmt versions match the devenv shell
+  git-hooks.tools = {
+    cargo = lib.mkForce config.languages.rust.toolchainPackage;
+    clippy = lib.mkForce config.languages.rust.toolchainPackage;
+    rustfmt = lib.mkForce config.languages.rust.toolchainPackage;
+  };
+
   git-hooks.hooks = {
     rustfmt.enable = true;
     clippy.enable = true;

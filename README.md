@@ -6,8 +6,7 @@
 
 A TUI dashboard for Claude Code usage limits.
 
-<img width="479" height="443" alt="image" src="https://github.com/user-attachments/assets/5a8b7892-0906-4ff3-a1ee-c88d3a47dd7e" />
-
+![claude-stats screenshot](docs/screenshot.png)
 
 ## Features
 

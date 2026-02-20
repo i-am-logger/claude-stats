@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Gauge, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -175,12 +175,7 @@ fn render_limit(
 ) {
     let percent = limit.percent();
 
-    // Title
-    let title_w = Paragraph::new(Line::from(Span::styled(title, Style::default())));
-    frame.render_widget(title_w, padded(chunks[*i]));
-    *i += 1;
-
-    // Usage gauge with label inside
+    // Title with percentage
     let color = if percent >= 85 {
         Color::Red
     } else if percent >= 70 {
@@ -188,12 +183,28 @@ fn render_limit(
     } else {
         Color::Reset
     };
+    let title_w = Paragraph::new(Line::from(vec![
+        Span::styled(title, Style::default()),
+        Span::styled(format!(" ({}%)", percent), Style::default().fg(color)),
+    ]));
+    frame.render_widget(title_w, padded(chunks[*i]));
+    *i += 1;
 
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(color).bg(GAUGE_BG))
-        .percent(percent.min(100))
-        .label(format!("{}%", percent));
-    frame.render_widget(gauge, padded(chunks[*i]));
+    // Segmented usage bar
+    let bar_area = padded(chunks[*i]);
+    let width = bar_area.width as usize;
+    let filled = if width > 0 {
+        (percent.min(100) as usize * width) / 100
+    } else {
+        0
+    };
+    let mut spans = Vec::with_capacity(width);
+    for j in 0..width {
+        let c = if j < filled { color } else { GAUGE_BG };
+        spans.push(Span::styled("▮", Style::default().fg(c)));
+    }
+    let bar = Paragraph::new(Line::from(spans));
+    frame.render_widget(bar, bar_area);
     *i += 1;
 
     // Reset timer
