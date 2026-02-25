@@ -20,6 +20,7 @@ in
     pkgs.git
     pkgs.pkg-config
     pkgs.nixpkgs-fmt
+    pkgs.cargo-watch
   ];
 
   # Development scripts
@@ -36,6 +37,10 @@ in
   scripts.dev-build.exec = ''
     echo "Building claude-stats..."
     cargo build --release
+  '';
+
+  scripts.dev-watch.exec = ''
+    cargo watch -x run
   '';
 
   # Environment variables
@@ -60,6 +65,7 @@ in
     echo "    • dev-test      - Run tests"
     echo "    • dev-run       - Run the application"
     echo "    • dev-build     - Build the application"
+    echo "    • dev-watch     - Watch and auto-reload"
     echo ""
   '';
 

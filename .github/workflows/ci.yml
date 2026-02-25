@@ -1,4 +1,4 @@
-name: build
+name: CI
 
 on:
   push:
@@ -15,8 +15,11 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test
-      - run: cargo build --release
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Build
+        run: cargo build --release

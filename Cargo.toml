@@ -14,12 +14,51 @@ ratatui = "0.29"
 crossterm = "0.29"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["rt", "macros"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "http2"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 dirs = "5.0"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
-color-eyre = "0.6"
+notify = "7.0"
+humantime = "2.3.0"
+thiserror = "2.0.18"
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# restriction lints — opt-in for code discipline
+allow_attributes_without_reason = "deny"
+clone_on_ref_ptr = "deny"
+dbg_macro = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+todo = "deny"
+unimplemented = "deny"
+unnecessary_self_imports = "deny"
+
+# nursery lints — catch likely bugs
+nursery = { level = "deny", priority = -1 }
+
+# pedantic overrides — suppress where they hurt readability
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+wildcard_imports = "allow"
+
+# nursery overrides — too noisy or false-positive heavy
+option_if_let_else = "allow"
+missing_const_for_fn = "allow"
+redundant_pub_crate = "allow"
+significant_drop_tightening = "allow"
 
 [profile.release]
 opt-level = 3

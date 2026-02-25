@@ -1,6 +1,9 @@
 use serde::Deserialize;
 
-/// Response from GET https://api.anthropic.com/api/oauth/usage
+const USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
+
+/// Response from GET <https://api.anthropic.com/api/oauth/usage>
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageData {
     pub five_hour: Option<UsageLimit>,
@@ -20,7 +23,7 @@ pub struct UsageLimit {
 
 impl UsageLimit {
     pub fn percent(&self) -> u16 {
-        self.utilization.map(|u| u.round() as u16).unwrap_or(0)
+        self.utilization.map_or(0, |u| u.round() as u16)
     }
 
     /// Seconds remaining until reset, or None if no reset time.
@@ -35,48 +38,79 @@ impl UsageLimit {
 
     /// Human-readable remaining time label with seconds.
     pub fn remaining_label(&self) -> String {
-        let secs = match self.remaining_secs() {
-            Some(s) => s,
-            None => return String::new(),
+        let Some(secs) = self.remaining_secs() else {
+            return String::new();
         };
 
         if secs <= 0 {
             "now".to_string()
-        } else if secs < 60 {
-            format!("{}s", secs)
-        } else if secs < 3600 {
-            format!("{}m {:02}s", secs / 60, secs % 60)
-        } else if secs < 86400 {
-            let hours = secs / 3600;
-            let mins = (secs % 3600) / 60;
-            let s = secs % 60;
-            format!("{}h {:02}m {:02}s", hours, mins, s)
         } else {
-            let days = secs / 86400;
-            let hours = (secs % 86400) / 3600;
-            let mins = (secs % 3600) / 60;
-            format!("{}d {}h {:02}m", days, hours, mins)
+            crate::fmt::format_duration(secs)
         }
     }
 }
 
-pub async fn fetch_usage(token: &str) -> anyhow::Result<UsageData> {
-    let client = reqwest::Client::new();
+pub async fn fetch_usage(
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<UsageData, crate::error::FetchError> {
     let resp = client
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .header("Authorization", format!("Bearer {}", token))
+        .get(USAGE_API_URL)
+        .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/json")
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .timeout(std::time::Duration::from_secs(10))
+        .header("anthropic-beta", ANTHROPIC_BETA)
         .send()
         .await?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("API returned {}: {}", status, body);
-    }
-
+    let resp = crate::error::check_response(resp).await?;
     let data: UsageData = resp.json().await?;
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limit(utilization: Option<f64>, resets_at: Option<&str>) -> UsageLimit {
+        UsageLimit {
+            utilization,
+            resets_at: resets_at.map(String::from),
+        }
+    }
+
+    #[test]
+    fn percent_rounds() {
+        assert_eq!(limit(Some(42.4), None).percent(), 42);
+        assert_eq!(limit(Some(42.5), None).percent(), 43);
+        assert_eq!(limit(Some(99.9), None).percent(), 100);
+    }
+
+    #[test]
+    fn percent_none_utilization() {
+        assert_eq!(limit(None, None).percent(), 0);
+    }
+
+    #[test]
+    fn remaining_secs_none_without_reset() {
+        assert_eq!(limit(None, None).remaining_secs(), None);
+    }
+
+    #[test]
+    fn remaining_secs_past_date_is_zero() {
+        let secs = limit(None, Some("2020-01-01T00:00:00Z")).remaining_secs();
+        assert_eq!(secs, Some(0));
+    }
+
+    #[test]
+    fn remaining_label_empty_without_reset() {
+        assert_eq!(limit(None, None).remaining_label(), "");
+    }
+
+    #[test]
+    fn remaining_label_past_date_is_now() {
+        assert_eq!(
+            limit(None, Some("2020-01-01T00:00:00Z")).remaining_label(),
+            "now"
+        );
+    }
 }

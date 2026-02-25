@@ -1,6 +1,8 @@
+pub mod incidents;
+pub mod sessions;
 pub mod usage;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthStatus {
     Ok,
     Slow,
