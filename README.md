@@ -14,8 +14,9 @@ A TUI dashboard for monitoring Claude Code usage limits and active sessions.
 - Active session monitoring with context window utilization
 - Subagent tracking with model, token count, and state
 - Claude API status and incident display
-- Auto-refreshes every 5 seconds
-- Displays your plan type (Pro, Max, Team, Enterprise)
+- Auto-refreshes every 30 seconds
+- Displays account email and plan type (Pro, Max, Team, Enterprise)
+- Claude Code version display with update indicator
 - Countdown timers showing when limits reset
 - Color-coded warnings at 70% and 85% utilization
 - Activity and health status indicators
