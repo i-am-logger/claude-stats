@@ -1,7 +1,6 @@
 use serde::Deserialize;
 
 const USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
 
 /// Response from GET <https://api.anthropic.com/api/oauth/usage>
 #[derive(Debug, Clone, Deserialize)]
@@ -58,7 +57,7 @@ pub(crate) async fn fetch_usage(
     let resp = client
         .get(USAGE_API_URL)
         .header("Authorization", format!("Bearer {token}"))
-        .header("anthropic-beta", ANTHROPIC_BETA)
+        .header("anthropic-beta", super::ANTHROPIC_BETA)
         .send()
         .await?;
 

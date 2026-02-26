@@ -1,4 +1,6 @@
-use crate::data::{incidents::StatusData, sessions::SessionData, usage::UsageData};
+use crate::data::{
+    claude_version::ClaudeVersion, incidents::StatusData, sessions::SessionData, usage::UsageData,
+};
 use crate::error::FetchError;
 use std::time::Duration;
 
@@ -10,10 +12,14 @@ pub(crate) enum AppEvent {
     UsageUpdated {
         data: Result<UsageData, FetchError>,
         elapsed: Duration,
+    },
+    AccountUpdated {
+        email: Option<String>,
         plan: Option<crate::credentials::Plan>,
     },
     StatusUpdated(Result<StatusData, FetchError>),
     SessionsUpdated(Vec<SessionData>),
+    ClaudeVersionUpdated(ClaudeVersion),
     Key(crossterm::event::KeyEvent),
     Shutdown,
 }

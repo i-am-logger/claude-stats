@@ -2,8 +2,8 @@ use crate::data::incidents;
 use crate::event::{AppEvent, EventTx};
 use std::time::Duration;
 
-const NORMAL_INTERVAL: Duration = Duration::from_secs(5);
-const BACKOFF_INTERVAL: Duration = Duration::from_secs(30);
+const NORMAL_INTERVAL: Duration = Duration::from_secs(30);
+const BACKOFF_INTERVAL: Duration = Duration::from_secs(60);
 const BACKOFF_THRESHOLD: u32 = 3;
 
 pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {

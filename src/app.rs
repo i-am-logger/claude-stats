@@ -1,5 +1,8 @@
 use crate::credentials::Plan;
-use crate::data::{incidents::StatusData, sessions::SessionData, usage::UsageData, HealthStatus};
+use crate::data::{
+    claude_version::ClaudeVersion, incidents::StatusData, sessions::SessionData, usage::UsageData,
+    HealthStatus,
+};
 use crate::error::FetchError;
 use crate::event::{AppEvent, EventRx, EventTx};
 use crate::ui;
@@ -23,6 +26,8 @@ pub(crate) struct State {
     pub(crate) health: Option<HealthStatus>,
     pub(crate) fetching: bool,
     pub(crate) plan: Option<Plan>,
+    pub(crate) account_email: Option<String>,
+    pub(crate) claude_version: Option<ClaudeVersion>,
     pub(crate) tick: u64,
 }
 
@@ -34,14 +39,7 @@ impl State {
             AppEvent::UsageFetching => {
                 self.fetching = true;
             }
-            AppEvent::UsageUpdated {
-                data,
-                elapsed,
-                plan,
-            } => {
-                if plan.is_some() {
-                    self.plan = plan;
-                }
+            AppEvent::UsageUpdated { data, elapsed } => {
                 match data {
                     Ok(data) => {
                         self.usage = Some(data);
@@ -63,8 +61,15 @@ impl State {
                 Ok(data) => self.status = Some(data),
                 Err(e) => self.status_error = Some(e),
             },
+            AppEvent::AccountUpdated { email, plan } => {
+                self.account_email = email;
+                self.plan = plan;
+            }
             AppEvent::SessionsUpdated(sessions) => {
                 self.sessions = sessions;
+            }
+            AppEvent::ClaudeVersionUpdated(version) => {
+                self.claude_version = Some(version);
             }
             AppEvent::Key(key) => {
                 if key.kind == crossterm::event::KeyEventKind::Press
@@ -94,27 +99,13 @@ impl App {
     pub(crate) async fn new() -> Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        let initial_plan = crate::workers::blocking(
-            crate::credentials::get_credentials,
-            Err(crate::error::CredentialError::FileNotFound),
-        )
-        .await
-        .ok()
-        .and_then(|c| c.plan);
-
         let initial_sessions =
             crate::workers::blocking(crate::data::sessions::scan_active_sessions, Vec::new()).await;
 
         let state = State {
-            usage: None,
             sessions: initial_sessions,
-            status: None,
-            error: None,
-            status_error: None,
-            health: None,
             fetching: true,
-            plan: initial_plan,
-            tick: 0,
+            ..State::default()
         };
 
         let workers = spawn_workers(&tx)?;
@@ -170,7 +161,8 @@ fn spawn_workers(tx: &EventTx) -> Result<Vec<JoinHandle<()>>> {
     let client = crate::workers::build_http_client().context("failed to build HTTP client")?;
     let handles = vec![
         crate::workers::usage::spawn(tx.clone(), client.clone()),
-        crate::workers::status::spawn(tx.clone(), client),
+        crate::workers::status::spawn(tx.clone(), client.clone()),
+        crate::workers::claude_version::spawn(tx.clone(), client),
         crate::workers::sessions::spawn(tx.clone()),
     ];
     Ok(handles)
@@ -269,7 +261,6 @@ mod tests {
         let shutdown = state.handle(AppEvent::UsageUpdated {
             data: Ok(dummy_usage()),
             elapsed: Duration::from_millis(100),
-            plan: None,
         });
         assert!(!shutdown);
         assert!(!state.fetching);
@@ -287,7 +278,6 @@ mod tests {
         let shutdown = state.handle(AppEvent::UsageUpdated {
             data: Err(FetchError::Timeout),
             elapsed: Duration::from_millis(100),
-            plan: None,
         });
         assert!(!shutdown);
         assert!(!state.fetching);
@@ -301,7 +291,6 @@ mod tests {
         let shutdown = state.handle(AppEvent::UsageUpdated {
             data: Ok(dummy_usage()),
             elapsed: Duration::from_secs(5),
-            plan: None,
         });
         assert!(!shutdown);
         assert_eq!(state.health, Some(HealthStatus::Slow));
@@ -347,5 +336,59 @@ mod tests {
     fn handle_key_other_returns_false() {
         let mut state = State::default();
         assert!(!state.handle(make_key(KeyCode::Char('a'))));
+    }
+
+    #[test]
+    fn handle_claude_version_updated() {
+        let mut state = State::default();
+        assert!(state.claude_version.is_none());
+        let version = ClaudeVersion {
+            installed: Some("1.0.16".into()),
+            latest: Some("1.0.17".into()),
+        };
+        let shutdown = state.handle(AppEvent::ClaudeVersionUpdated(version.clone()));
+        assert!(!shutdown);
+        assert_eq!(state.claude_version, Some(version));
+    }
+
+    #[test]
+    fn handle_account_updated_sets_email_and_plan() {
+        let mut state = State::default();
+        state.handle(AppEvent::AccountUpdated {
+            email: Some("user@example.com".into()),
+            plan: Some(Plan::Max),
+        });
+        assert_eq!(state.account_email.as_deref(), Some("user@example.com"));
+        assert_eq!(state.plan, Some(Plan::Max));
+    }
+
+    #[test]
+    fn handle_account_updated_clears_on_logout() {
+        let mut state = State {
+            account_email: Some("user@example.com".into()),
+            plan: Some(Plan::Max),
+            ..State::default()
+        };
+        state.handle(AppEvent::AccountUpdated {
+            email: None,
+            plan: None,
+        });
+        assert_eq!(state.account_email, None);
+        assert_eq!(state.plan, None);
+    }
+
+    #[test]
+    fn handle_account_updated_replaces_account() {
+        let mut state = State {
+            account_email: Some("old@example.com".into()),
+            plan: Some(Plan::Pro),
+            ..State::default()
+        };
+        state.handle(AppEvent::AccountUpdated {
+            email: Some("new@example.com".into()),
+            plan: Some(Plan::Max),
+        });
+        assert_eq!(state.account_email.as_deref(), Some("new@example.com"));
+        assert_eq!(state.plan, Some(Plan::Max));
     }
 }

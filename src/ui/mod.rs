@@ -20,7 +20,11 @@ use usage_limits::UsageLimitsSection;
 pub(crate) fn render(state: &State, frame: &mut Frame<'_>) {
     let area = frame.area();
 
-    let header = HeaderSection { plan: &state.plan };
+    let header = HeaderSection {
+        plan: &state.plan,
+        account_email: &state.account_email,
+        claude_version: &state.claude_version,
+    };
     let status = StatusSection {
         status: &state.status,
     };

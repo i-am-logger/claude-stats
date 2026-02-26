@@ -1,3 +1,4 @@
+pub(crate) mod claude_version;
 pub(crate) mod sessions;
 pub(crate) mod status;
 pub(crate) mod usage;
