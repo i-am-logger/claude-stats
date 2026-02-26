@@ -269,8 +269,10 @@ mod tests {
 
     #[test]
     fn handle_usage_updated_ok() {
-        let mut state = State::default();
-        state.fetching = true;
+        let mut state = State {
+            fetching: true,
+            ..State::default()
+        };
         let shutdown = state.handle(AppEvent::UsageUpdated {
             data: Ok(dummy_usage()),
             elapsed: Duration::from_millis(100),
@@ -285,8 +287,10 @@ mod tests {
 
     #[test]
     fn handle_usage_updated_error() {
-        let mut state = State::default();
-        state.fetching = true;
+        let mut state = State {
+            fetching: true,
+            ..State::default()
+        };
         let shutdown = state.handle(AppEvent::UsageUpdated {
             data: Err(FetchError::Timeout),
             elapsed: Duration::from_millis(100),

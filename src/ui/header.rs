@@ -1,4 +1,4 @@
-use crate::ui::common::{padded, Section};
+use crate::ui::common::{padded, Section, DIM};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -6,6 +6,8 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct HeaderSection<'a> {
     pub plan: &'a Option<crate::credentials::Plan>,
@@ -26,14 +28,21 @@ impl Section for HeaderSection<'_> {
             ])
             .split(area);
 
-        let header_text = match self.plan {
-            Some(name) => format!("{name} — usage limits"),
-            None => "Plan usage limits".to_string(),
-        };
-        let header = Paragraph::new(Line::from(Span::styled(
-            header_text,
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
+        let mut spans = vec![
+            Span::styled(
+                "Claude Stats",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" v{VERSION}"), Style::default().fg(DIM)),
+        ];
+        if let Some(plan) = self.plan {
+            spans.push(Span::styled(" — ", Style::default().fg(DIM)));
+            spans.push(Span::styled(
+                plan.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+        let header = Paragraph::new(Line::from(spans));
         frame.render_widget(header, padded(chunks[1]));
     }
 }

@@ -4,13 +4,16 @@
 
 # claude-stats
 
-A TUI dashboard for Claude Code usage limits.
+A TUI dashboard for monitoring Claude Code usage limits and active sessions.
 
 ![claude-stats screenshot](docs/screenshot.png)
 
 ## Features
 
 - Live usage gauges for session, weekly (all models), Opus, and Sonnet limits
+- Active session monitoring with context window utilization
+- Subagent tracking with model, token count, and state
+- Claude API status and incident display
 - Auto-refreshes every 5 seconds
 - Displays your plan type (Pro, Max, Team, Enterprise)
 - Countdown timers showing when limits reset
