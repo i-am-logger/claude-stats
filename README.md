@@ -1,6 +1,5 @@
-[![build](https://github.com/i-am-logger/claude-stats/actions/workflows/ci.yml/badge.svg)](https://github.com/i-am-logger/claude-stats/actions/workflows/ci.yml)
-[![release](https://github.com/i-am-logger/claude-stats/actions/workflows/release-please.yml/badge.svg)](https://github.com/i-am-logger/claude-stats/actions/workflows/release-please.yml)
 [![GitHub release](https://img.shields.io/github/v/release/i-am-logger/claude-stats)](https://github.com/i-am-logger/claude-stats/releases/latest)
+[![build](https://github.com/i-am-logger/claude-stats/actions/workflows/ci.yml/badge.svg)](https://github.com/i-am-logger/claude-stats/actions/workflows/ci.yml)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 
 # claude-stats
