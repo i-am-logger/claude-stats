@@ -10,7 +10,7 @@ use std::time::Duration;
 /// usage/status workers.
 const FALLBACK_POLL_TICKS: u64 = 10;
 
-pub fn spawn(tx: EventTx) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn(tx: EventTx) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let dirty = Arc::new(AtomicBool::new(false));
         let watcher = setup_watcher(&dirty);
@@ -33,14 +33,7 @@ pub fn spawn(tx: EventTx) -> tokio::task::JoinHandle<()> {
             };
 
             if should_scan {
-                let data = tokio::task::spawn_blocking(sessions::scan_active_sessions)
-                    .await
-                    .unwrap_or_else(|e| {
-                        if e.is_panic() {
-                            std::panic::resume_unwind(e.into_panic());
-                        }
-                        Vec::new()
-                    });
+                let data = super::blocking(sessions::scan_active_sessions, Vec::new()).await;
                 if tx.send(AppEvent::SessionsUpdated(data)).await.is_err() {
                     break;
                 }

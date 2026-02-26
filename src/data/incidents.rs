@@ -7,7 +7,7 @@ const INCIDENTS_API_URL: &str = "https://status.claude.com/api/v2/incidents/unre
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum IncidentStatus {
+pub(crate) enum IncidentStatus {
     Investigating,
     Identified,
     Monitoring,
@@ -32,7 +32,7 @@ impl fmt::Display for IncidentStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum IncidentImpact {
+pub(crate) enum IncidentImpact {
     None,
     Minor,
     Major,
@@ -43,7 +43,7 @@ pub enum IncidentImpact {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum StatusIndicator {
+pub(crate) enum StatusIndicator {
     None,
     Minor,
     Major,
@@ -64,29 +64,29 @@ struct IncidentUpdate {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Incident {
-    pub name: String,
-    pub status: IncidentStatus,
-    pub impact: IncidentImpact,
-    pub started_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+pub(crate) struct Incident {
+    pub(crate) name: String,
+    pub(crate) status: IncidentStatus,
+    pub(crate) impact: IncidentImpact,
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
     #[serde(default, rename = "incident_updates")]
     updates: Vec<IncidentUpdate>,
 }
 
 impl Incident {
     /// Latest update body text, if any.
-    pub fn latest_body(&self) -> Option<&str> {
+    pub(crate) fn latest_body(&self) -> Option<&str> {
         self.updates.first().map(|u| u.body.as_str())
     }
 
     /// Human-friendly relative time label, e.g. "2h 15m ago".
-    pub fn started_ago(&self) -> String {
+    pub(crate) fn started_ago(&self) -> String {
         relative_time(Utc::now() - self.started_at)
     }
 
     /// How long since the last update.
-    pub fn updated_ago(&self) -> String {
+    pub(crate) fn updated_ago(&self) -> String {
         let latest = self
             .updates
             .first()
@@ -111,19 +111,19 @@ struct StatusResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct StatusSummary {
-    pub indicator: StatusIndicator,
-    pub description: String,
+pub(crate) struct StatusSummary {
+    pub(crate) indicator: StatusIndicator,
+    pub(crate) description: String,
 }
 
 /// Combined result: overall status + unresolved incidents.
 #[derive(Debug, Clone)]
-pub struct StatusData {
-    pub summary: StatusSummary,
-    pub incidents: Vec<Incident>,
+pub(crate) struct StatusData {
+    pub(crate) summary: StatusSummary,
+    pub(crate) incidents: Vec<Incident>,
 }
 
-pub async fn fetch_status(
+pub(crate) async fn fetch_status(
     client: &reqwest::Client,
 ) -> Result<StatusData, crate::error::FetchError> {
     let (status_resp, incidents_resp) = tokio::join!(
@@ -138,13 +138,9 @@ pub async fn fetch_status(
     };
 
     let incidents = {
-        let resp = incidents_resp?;
-        if resp.status().is_success() {
-            let data: IncidentsResponse = resp.json().await?;
-            data.incidents
-        } else {
-            Vec::new()
-        }
+        let resp = crate::error::check_response(incidents_resp?).await?;
+        let data: IncidentsResponse = resp.json().await?;
+        data.incidents
     };
 
     Ok(StatusData { summary, incidents })

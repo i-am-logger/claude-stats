@@ -5,15 +5,15 @@ const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
 
 /// Response from GET <https://api.anthropic.com/api/oauth/usage>
 #[derive(Debug, Clone, Deserialize)]
-pub struct UsageData {
-    pub five_hour: Option<UsageLimit>,
-    pub seven_day: Option<UsageLimit>,
-    pub seven_day_opus: Option<UsageLimit>,
-    pub seven_day_sonnet: Option<UsageLimit>,
+pub(crate) struct UsageData {
+    pub(crate) five_hour: Option<UsageLimit>,
+    pub(crate) seven_day: Option<UsageLimit>,
+    pub(crate) seven_day_opus: Option<UsageLimit>,
+    pub(crate) seven_day_sonnet: Option<UsageLimit>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct UsageLimit {
+pub(crate) struct UsageLimit {
     #[serde(default)]
     pub utilization: Option<f64>,
 
@@ -22,13 +22,13 @@ pub struct UsageLimit {
 }
 
 impl UsageLimit {
-    pub fn percent(&self) -> u16 {
+    pub(crate) fn percent(&self) -> u16 {
         self.utilization
             .map_or(0, |u| u.round().clamp(0.0, 100.0) as u16)
     }
 
     /// Seconds remaining until reset, or None if no reset time.
-    pub fn remaining_secs(&self) -> Option<i64> {
+    pub(crate) fn remaining_secs(&self) -> Option<i64> {
         let ts = self.resets_at.as_ref()?;
         let dt = chrono::DateTime::parse_from_rfc3339(ts)
             .ok()?
@@ -38,7 +38,7 @@ impl UsageLimit {
     }
 
     /// Human-readable remaining time label with seconds.
-    pub fn remaining_label(&self) -> String {
+    pub(crate) fn remaining_label(&self) -> String {
         let Some(secs) = self.remaining_secs() else {
             return String::new();
         };
@@ -51,7 +51,7 @@ impl UsageLimit {
     }
 }
 
-pub async fn fetch_usage(
+pub(crate) async fn fetch_usage(
     client: &reqwest::Client,
     token: &str,
 ) -> Result<UsageData, crate::error::FetchError> {

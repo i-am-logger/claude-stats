@@ -2,10 +2,10 @@ use crate::data::{incidents::StatusData, sessions::SessionData, usage::UsageData
 use crate::error::FetchError;
 use std::time::Duration;
 
-pub type EventTx = tokio::sync::mpsc::Sender<AppEvent>;
-pub type EventRx = tokio::sync::mpsc::Receiver<AppEvent>;
+pub(crate) type EventTx = tokio::sync::mpsc::Sender<AppEvent>;
+pub(crate) type EventRx = tokio::sync::mpsc::Receiver<AppEvent>;
 
-pub enum AppEvent {
+pub(crate) enum AppEvent {
     UsageFetching,
     UsageUpdated {
         data: Result<UsageData, FetchError>,

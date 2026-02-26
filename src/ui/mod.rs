@@ -17,7 +17,7 @@ use ratatui::{
 use status_section::StatusSection;
 use usage_limits::UsageLimitsSection;
 
-pub fn render(state: &State, frame: &mut Frame) {
+pub(crate) fn render(state: &State, frame: &mut Frame<'_>) {
     let area = frame.area();
 
     let header = HeaderSection { plan: &state.plan };

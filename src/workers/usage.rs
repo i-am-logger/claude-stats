@@ -8,7 +8,7 @@ const NORMAL_INTERVAL: Duration = Duration::from_secs(5);
 const BACKOFF_INTERVAL: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;
 
-pub fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut consecutive_cred_errors: u32 = 0;
 
@@ -17,14 +17,11 @@ pub fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()
                 break;
             }
 
-            let creds_result = tokio::task::spawn_blocking(credentials::get_credentials)
-                .await
-                .unwrap_or_else(|e| {
-                    if e.is_panic() {
-                        std::panic::resume_unwind(e.into_panic());
-                    }
-                    Err(CredentialError::FileNotFound)
-                });
+            let creds_result = super::blocking(
+                credentials::get_credentials,
+                Err(CredentialError::FileNotFound),
+            )
+            .await;
 
             match creds_result {
                 Ok(creds) => {

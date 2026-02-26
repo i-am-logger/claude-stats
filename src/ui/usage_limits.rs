@@ -13,10 +13,10 @@ use ratatui::{
 /// colour changes from red to yellow to indicate the reset is imminent.
 const RESET_SOON_SECS: i64 = 1800;
 
-pub struct UsageLimitsSection<'a> {
-    pub usage: &'a Option<UsageData>,
-    pub error: &'a Option<FetchError>,
-    pub fetching: bool,
+pub(super) struct UsageLimitsSection<'a> {
+    pub(super) usage: &'a Option<UsageData>,
+    pub(super) error: &'a Option<FetchError>,
+    pub(super) fetching: bool,
 }
 
 impl Section for UsageLimitsSection<'_> {
@@ -41,7 +41,7 @@ impl Section for UsageLimitsSection<'_> {
         }
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         if let Some(ref data) = self.usage {
             let limits: Vec<(&str, &Option<UsageLimit>)> = vec![
                 ("◔ Current session", &data.five_hour),
@@ -98,7 +98,7 @@ impl Section for UsageLimitsSection<'_> {
 fn render_limit(
     title: &str,
     limit: &UsageLimit,
-    frame: &mut Frame,
+    frame: &mut Frame<'_>,
     chunks: &[Rect],
     i: &mut usize,
 ) {
@@ -110,11 +110,12 @@ fn render_limit(
         Span::styled(title, Style::default()),
         Span::styled(format!(" ({percent}%)"), Style::default().fg(color)),
     ]));
-    frame.render_widget(title_w, padded(chunks[*i]));
+    let Some(&area) = chunks.get(*i) else { return };
+    frame.render_widget(title_w, padded(area));
     *i += 1;
 
-    let bar_area = padded(chunks[*i]);
-    render_bar(frame, bar_area, percent, color);
+    let Some(&area) = chunks.get(*i) else { return };
+    render_bar(frame, padded(area), percent, color);
     *i += 1;
 
     if let Some(remaining) = limit.remaining_secs() {
@@ -132,7 +133,8 @@ fn render_limit(
             format!("Resets in {label}"),
             Style::default().fg(timer_color),
         )));
-        frame.render_widget(timer, padded(chunks[*i]));
+        let Some(&area) = chunks.get(*i) else { return };
+        frame.render_widget(timer, padded(area));
     }
     *i += 1;
 }

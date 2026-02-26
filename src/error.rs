@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
-pub enum FetchError {
+pub(crate) enum FetchError {
     #[error("API error ({status}): {body}")]
     Api { status: u16, body: String },
 
@@ -32,7 +32,9 @@ impl From<reqwest::Error> for FetchError {
 
 /// Check an HTTP response status and return the response on success, or a
 /// `FetchError::Api` with the status code and body text on failure.
-pub async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response, FetchError> {
+pub(crate) async fn check_response(
+    resp: reqwest::Response,
+) -> Result<reqwest::Response, FetchError> {
     if resp.status().is_success() {
         return Ok(resp);
     }
@@ -45,7 +47,7 @@ pub async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response
 }
 
 #[derive(Debug, Clone, Error)]
-pub enum CredentialError {
+pub(crate) enum CredentialError {
     #[error("home directory not found")]
     NoHomeDir,
 

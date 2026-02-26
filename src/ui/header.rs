@@ -9,8 +9,8 @@ use ratatui::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub struct HeaderSection<'a> {
-    pub plan: &'a Option<crate::credentials::Plan>,
+pub(super) struct HeaderSection<'a> {
+    pub(super) plan: &'a Option<crate::credentials::Plan>,
 }
 
 impl Section for HeaderSection<'_> {
@@ -18,7 +18,7 @@ impl Section for HeaderSection<'_> {
         3
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -43,6 +43,7 @@ impl Section for HeaderSection<'_> {
             ));
         }
         let header = Paragraph::new(Line::from(spans));
-        frame.render_widget(header, padded(chunks[1]));
+        let Some(&area) = chunks.get(1) else { return };
+        frame.render_widget(header, padded(area));
     }
 }

@@ -8,8 +8,8 @@ use ratatui::{
     Frame,
 };
 
-pub struct StatusSection<'a> {
-    pub status: &'a Option<StatusData>,
+pub(super) struct StatusSection<'a> {
+    pub(super) status: &'a Option<StatusData>,
 }
 
 fn indicator_color(indicator: StatusIndicator) -> Color {
@@ -46,7 +46,7 @@ impl Section for StatusSection<'_> {
         self.constraints().map_or(0, |c| c.len() as u16)
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let Some(sd) = self.status else { return };
         let Some(constraints) = self.constraints() else {
             return;
@@ -76,7 +76,8 @@ impl Section for StatusSection<'_> {
                 Style::default().fg(color),
             ),
         ]));
-        frame.render_widget(status_header, padded(chunks[i]));
+        let Some(area) = chunks.get(i) else { return };
+        frame.render_widget(status_header, padded(*area));
         i += 1;
 
         if !sd.incidents.is_empty() {
@@ -97,11 +98,13 @@ impl Section for StatusSection<'_> {
                     ),
                     Span::styled(&incident.name, Style::default().fg(impact_color)),
                 ]));
-                frame.render_widget(row, indented(chunks[i]));
+                let Some(area) = chunks.get(i) else { return };
+                frame.render_widget(row, indented(*area));
                 i += 1;
 
                 if let Some(body) = incident.latest_body() {
-                    let body_area = indented(chunks[i]);
+                    let Some(area) = chunks.get(i) else { return };
+                    let body_area = indented(*area);
                     let max_len = body_area.width as usize;
                     let clean = body.replace('\n', " ");
                     let truncated = if clean.chars().count() > max_len {
@@ -126,7 +129,8 @@ impl Section for StatusSection<'_> {
                     ),
                     Style::default().fg(DIM),
                 )));
-                frame.render_widget(timing, indented(chunks[i]));
+                let Some(area) = chunks.get(i) else { return };
+                frame.render_widget(timing, indented(*area));
                 i += 1;
             }
         }

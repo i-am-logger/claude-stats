@@ -63,7 +63,7 @@ fn restore_terminal() -> Result<()> {
 fn install_panic_hook() {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        let _ = restore_terminal();
+        drop(restore_terminal());
         original_hook(panic_info);
     }));
 }

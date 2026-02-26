@@ -8,9 +8,9 @@ use ratatui::{
     Frame,
 };
 
-pub struct ContextsSection<'a> {
-    pub sessions: &'a [SessionData],
-    pub tick: u64,
+pub(super) struct ContextsSection<'a> {
+    pub(super) sessions: &'a [SessionData],
+    pub(super) tick: u64,
 }
 
 impl Section for ContextsSection<'_> {
@@ -27,7 +27,7 @@ impl Section for ContextsSection<'_> {
         h
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect) {
+    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         if self.sessions.is_empty() {
             return;
         }
@@ -53,34 +53,32 @@ impl Section for ContextsSection<'_> {
 
         let mut i = 0;
 
+        let Some(&header_area) = chunks.get(i) else {
+            return;
+        };
         let ctx_header = Paragraph::new(Line::from(Span::styled(
             format!("⊙ Active contexts ({})", self.sessions.len()),
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        frame.render_widget(ctx_header, padded(chunks[i]));
-        i += 1;
-        i += 1; // blank
+        frame.render_widget(ctx_header, padded(header_area));
+        i += 2; // header + blank
 
         for session in self.sessions {
-            render_title_row(session, self.tick, frame, chunks[i]);
-            i += 1;
-            render_context_bar(session, frame, chunks[i]);
-            i += 1;
-            render_info_row(session, frame, chunks[i]);
-            i += 1;
-            render_state_row(session, frame, chunks[i]);
-            i += 1;
+            let Some(rows) = chunks.get(i..i + 4) else {
+                return;
+            };
+            render_title_row(session, self.tick, frame, rows[0]);
+            render_context_bar(session, frame, rows[1]);
+            render_info_row(session, frame, rows[2]);
+            render_state_row(session, frame, rows[3]);
+            i += 4;
             render_agents(&session.agents, frame, &chunks, &mut i);
             i += 1; // spacer
         }
     }
 }
 
-fn activity_label(secs: u64) -> String {
-    format!("{} ago", crate::fmt::format_duration(secs.cast_signed()))
-}
-
-fn render_title_row(session: &SessionData, tick: u64, frame: &mut Frame, area: Rect) {
+fn render_title_row(session: &SessionData, tick: u64, frame: &mut Frame<'_>, area: Rect) {
     let bar_color = percent_color(session.context_percent);
     let percent = session.context_percent;
     let tokens_k = session.context_tokens as f64 / 1000.0;
@@ -112,7 +110,7 @@ fn render_title_row(session: &SessionData, tick: u64, frame: &mut Frame, area: R
     frame.render_widget(row, indented(area));
 }
 
-fn render_context_bar(session: &SessionData, frame: &mut Frame, area: Rect) {
+fn render_context_bar(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
     let bar_area = indented(area);
     render_bar(
         frame,
@@ -122,7 +120,7 @@ fn render_context_bar(session: &SessionData, frame: &mut Frame, area: Rect) {
     );
 }
 
-fn render_info_row(session: &SessionData, frame: &mut Frame, area: Rect) {
+fn render_info_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
     let mut spans = vec![
         Span::styled("⎇ ", Style::default().fg(DIM)),
         Span::styled(&session.git_branch, Style::default().fg(DIM)),
@@ -134,13 +132,13 @@ fn render_info_row(session: &SessionData, frame: &mut Frame, area: Rect) {
         ));
     }
     spans.push(Span::styled(
-        format!("  {}", activity_label(session.last_activity_secs)),
+        format!("  {}", &session.last_activity_label),
         Style::default().fg(DIM),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), indented(area));
 }
 
-fn render_state_row(session: &SessionData, frame: &mut Frame, area: Rect) {
+fn render_state_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
     let state_color = match session.state {
         SessionState::Thinking => Color::Cyan,
         SessionState::Working => Color::Green,
@@ -178,8 +176,11 @@ fn agent_indent(r: Rect) -> Rect {
         .split(r)[1]
 }
 
-fn render_agents(agents: &[SubagentData], frame: &mut Frame, chunks: &[Rect], i: &mut usize) {
+fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect], i: &mut usize) {
     for (idx, agent) in agents.iter().enumerate() {
+        let Some(&area) = chunks.get(*i) else {
+            return;
+        };
         let connector = if idx + 1 == agents.len() {
             "└ "
         } else {
@@ -193,7 +194,7 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame, chunks: &[Rect], i:
         let tokens_k = agent.context_tokens as f64 / 1000.0;
         let mut spans = vec![
             Span::styled(connector, Style::default().fg(DIM)),
-            Span::styled(&agent.model_short, Style::default().fg(Color::Blue)),
+            Span::styled(agent.model.to_string(), Style::default().fg(Color::Blue)),
             Span::styled(format!(" {tokens_k:.1}k"), Style::default().fg(DIM)),
             Span::styled(format!(" {a_state}"), Style::default().fg(a_color)),
         ];
@@ -203,7 +204,7 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame, chunks: &[Rect], i:
                 Style::default().fg(DIM),
             ));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), agent_indent(chunks[*i]));
+        frame.render_widget(Paragraph::new(Line::from(spans)), agent_indent(area));
         *i += 1;
     }
 }

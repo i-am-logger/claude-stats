@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Plan {
+pub(crate) enum Plan {
     Max,
     Pro,
     Team,
@@ -12,7 +12,7 @@ pub enum Plan {
 }
 
 impl Plan {
-    pub fn from_api(s: &str) -> Self {
+    pub(crate) fn from_api(s: &str) -> Self {
         match s {
             "max" => Self::Max,
             "pro" => Self::Pro,
@@ -35,12 +35,12 @@ impl fmt::Display for Plan {
     }
 }
 
-pub struct Credentials {
-    pub token: String,
-    pub plan: Option<Plan>,
+pub(crate) struct Credentials {
+    pub(crate) token: String,
+    pub(crate) plan: Option<Plan>,
 }
 
-pub fn get_credentials() -> Result<Credentials, CredentialError> {
+pub(crate) fn get_credentials() -> Result<Credentials, CredentialError> {
     let path = dirs::home_dir()
         .ok_or(CredentialError::NoHomeDir)?
         .join(".claude")

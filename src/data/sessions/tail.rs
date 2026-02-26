@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
 /// Claude's context window size in tokens. Used to compute context utilisation
 /// percentage. Must be non-zero to avoid division-by-zero in `parse_session`.
-pub const CONTEXT_WINDOW: u64 = 166_000;
+pub(crate) const CONTEXT_WINDOW: u64 = 166_000;
 const _: () = assert!(CONTEXT_WINDOW > 0);
 
 /// How far from the end of a session file to start scanning for token usage on
@@ -73,7 +73,7 @@ pub(super) fn parse_tail_stats(file: &fs::File, file_len: u64) -> TailStats {
         if stats.last_tokens > 0 || tail_bytes >= file_len || tail_bytes >= MAX_TAIL_BYTES {
             return stats;
         }
-        tail_bytes = (tail_bytes * 2).min(MAX_TAIL_BYTES);
+        tail_bytes = tail_bytes.saturating_mul(2).min(MAX_TAIL_BYTES);
     }
 }
 
@@ -275,5 +275,56 @@ mod tests {
     fn is_usage_line_rejects_user() {
         let line = r#"{"type":"user","usage":{}}"#;
         assert!(!is_usage_line(line));
+    }
+
+    // ── edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_json_line_truncated_json() {
+        assert!(parse_json_line(r#"{"type":"assistant","message":"#).is_none());
+    }
+
+    #[test]
+    fn parse_json_line_nested_braces() {
+        let val = parse_json_line(r#"{"a":{"b":{"c":1}}}"#);
+        assert!(val.is_some());
+        assert_eq!(val.unwrap().pointer("/a/b/c").unwrap(), 1);
+    }
+
+    #[test]
+    fn extract_tokens_negative_values_treated_as_zero() {
+        // JSON numbers that are negative won't parse as u64
+        let usage = serde_json::json!({"input_tokens": -5});
+        assert_eq!(extract_tokens(&usage), 0);
+    }
+
+    #[test]
+    fn extract_tokens_float_values_treated_as_zero() {
+        let usage = serde_json::json!({"input_tokens": 1.5});
+        assert_eq!(extract_tokens(&usage), 0);
+    }
+
+    #[test]
+    fn is_usage_line_empty_string() {
+        assert!(!is_usage_line(""));
+    }
+
+    #[test]
+    fn truncate_str_multibyte_unicode() {
+        // 4 emoji chars, truncate at 3 — should get 0 chars + "..."
+        // but since max=3 < 4, it takes first 3 chars without ellipsis
+        assert_eq!(truncate_str("🎉🎊🎈🎆", 3), "🎉🎊🎈");
+    }
+
+    #[test]
+    fn truncate_str_multibyte_exact_fit() {
+        // 4 chars at max=4 fits exactly — no truncation
+        assert_eq!(truncate_str("🎉🎊🎈🎆", 4), "🎉🎊🎈🎆");
+    }
+
+    #[test]
+    fn truncate_str_multibyte_with_ellipsis() {
+        // 5 emoji chars at max=4 → 1 char + "..."
+        assert_eq!(truncate_str("🎉🎊🎈🎆🎇", 4), "🎉...");
     }
 }

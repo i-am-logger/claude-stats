@@ -6,16 +6,16 @@ use ratatui::{
     Frame,
 };
 
-pub const DIM: Color = Color::DarkGray;
-pub const GAUGE_BG: Color = Color::DarkGray;
-pub const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub(super) const DIM: Color = Color::DarkGray;
+pub(super) const GAUGE_BG: Color = Color::DarkGray;
+pub(super) const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-pub trait Section {
+pub(super) trait Section {
     fn height(&self, width: u16) -> u16;
-    fn render(&self, frame: &mut Frame, area: Rect);
+    fn render(&self, frame: &mut Frame<'_>, area: Rect);
 }
 
-pub fn padded(r: Rect) -> Rect {
+pub(super) fn padded(r: Rect) -> Rect {
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -26,7 +26,7 @@ pub fn padded(r: Rect) -> Rect {
         .split(r)[1]
 }
 
-pub fn indented(r: Rect) -> Rect {
+pub(super) fn indented(r: Rect) -> Rect {
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -37,7 +37,7 @@ pub fn indented(r: Rect) -> Rect {
         .split(r)[1]
 }
 
-pub fn percent_color(percent: u16) -> Color {
+pub(super) fn percent_color(percent: u16) -> Color {
     if percent >= 85 {
         Color::Red
     } else if percent >= 70 {
@@ -47,7 +47,7 @@ pub fn percent_color(percent: u16) -> Color {
     }
 }
 
-pub fn render_bar(frame: &mut Frame, area: Rect, percent: u16, color: Color) {
+pub(super) fn render_bar(frame: &mut Frame<'_>, area: Rect, percent: u16, color: Color) {
     let width = area.width as usize;
     let filled = if width > 0 {
         (percent.min(100) as usize * width) / 100

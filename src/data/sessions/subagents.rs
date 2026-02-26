@@ -1,6 +1,6 @@
 use super::activity::detect_state_from_tail;
 use super::tail::{extract_tokens, is_usage_line, parse_json_line, seek_tail, truncate_str};
-use super::SubagentData;
+use super::{ModelShort, SubagentData};
 use std::fs;
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::Path;
@@ -50,13 +50,13 @@ fn parse_subagent(path: &Path) -> Option<SubagentData> {
     }
 
     let task = read_subagent_task(&file);
-    let (model_short, context_tokens) = read_subagent_usage(&file, file_len);
+    let (model, context_tokens) = read_subagent_usage(&file, file_len);
 
     let state = detect_state_from_tail(&file, file_len);
 
     Some(SubagentData {
         task,
-        model_short,
+        model,
         context_tokens,
         state,
     })
@@ -91,13 +91,13 @@ fn read_subagent_task(file: &fs::File) -> String {
     String::new()
 }
 
-fn read_subagent_usage(file: &fs::File, file_len: u64) -> (String, u64) {
+fn read_subagent_usage(file: &fs::File, file_len: u64) -> (ModelShort, u64) {
     let seek_pos = file_len.saturating_sub(super::RECENT_TAIL_BYTES);
     let Some(reader) = seek_tail(file, seek_pos) else {
-        return (String::new(), 0);
+        return (ModelShort::Unknown, 0);
     };
 
-    let mut model = String::new();
+    let mut model = ModelShort::Unknown;
     let mut tokens: u64 = 0;
 
     for line in reader.lines().map_while(Result::ok) {
@@ -114,22 +114,22 @@ fn read_subagent_usage(file: &fs::File, file_len: u64) -> (String, u64) {
             }
         }
         if let Some(m) = val.pointer("/message/model").and_then(|v| v.as_str()) {
-            model = shorten_model(m);
+            model = parse_model(m);
         }
     }
 
     (model, tokens)
 }
 
-pub(super) fn shorten_model(model: &str) -> String {
+fn parse_model(model: &str) -> ModelShort {
     if model.contains("opus") {
-        "opus".to_string()
+        ModelShort::Opus
     } else if model.contains("sonnet") {
-        "sonnet".to_string()
+        ModelShort::Sonnet
     } else if model.contains("haiku") {
-        "haiku".to_string()
+        ModelShort::Haiku
     } else {
-        model.split('-').next().unwrap_or(model).to_string()
+        ModelShort::Unknown
     }
 }
 
@@ -138,27 +138,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shorten_model_opus() {
-        assert_eq!(shorten_model("claude-opus-4-20250514"), "opus");
+    fn parse_model_opus() {
+        assert_eq!(parse_model("claude-opus-4-20250514"), ModelShort::Opus);
     }
 
     #[test]
-    fn shorten_model_sonnet() {
-        assert_eq!(shorten_model("claude-sonnet-4-20250514"), "sonnet");
+    fn parse_model_sonnet() {
+        assert_eq!(parse_model("claude-sonnet-4-20250514"), ModelShort::Sonnet);
     }
 
     #[test]
-    fn shorten_model_haiku() {
-        assert_eq!(shorten_model("claude-haiku-4-20250514"), "haiku");
+    fn parse_model_haiku() {
+        assert_eq!(parse_model("claude-haiku-4-20250514"), ModelShort::Haiku);
     }
 
     #[test]
-    fn shorten_model_unknown() {
-        assert_eq!(shorten_model("gpt-4o-2025"), "gpt");
+    fn parse_model_unknown() {
+        assert_eq!(parse_model("gpt-4o-2025"), ModelShort::Unknown);
     }
 
     #[test]
-    fn shorten_model_no_dash() {
-        assert_eq!(shorten_model("custom"), "custom");
+    fn parse_model_no_dash() {
+        assert_eq!(parse_model("custom"), ModelShort::Unknown);
     }
 }

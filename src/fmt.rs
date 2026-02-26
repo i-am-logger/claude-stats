@@ -4,7 +4,7 @@ use std::time::Duration;
 ///
 /// Thin wrapper around [`humantime::format_duration`] that accepts
 /// signed seconds (negative values are clamped to zero).
-pub fn format_duration(secs: i64) -> String {
+pub(crate) fn format_duration(secs: i64) -> String {
     let dur = Duration::from_secs(secs.max(0) as u64);
     humantime::format_duration(dur).to_string()
 }

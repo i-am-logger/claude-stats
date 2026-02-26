@@ -6,7 +6,7 @@ const NORMAL_INTERVAL: Duration = Duration::from_secs(5);
 const BACKOFF_INTERVAL: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;
 
-pub fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut consecutive_errors: u32 = 0;
 

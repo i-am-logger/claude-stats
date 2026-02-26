@@ -582,4 +582,79 @@ mod tests {
         });
         assert_eq!(extract_tool_names(&val), "Bash(ls), Read(bar.rs)");
     }
+
+    // ── edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn state_from_json_empty_object() {
+        let val = json!({});
+        assert_eq!(state_from_json(&val), SessionState::Idle);
+    }
+
+    #[test]
+    fn state_from_json_null_type() {
+        let val = json!({"type": null});
+        assert_eq!(state_from_json(&val), SessionState::Idle);
+    }
+
+    #[test]
+    fn state_from_json_numeric_type() {
+        let val = json!({"type": 42});
+        assert_eq!(state_from_json(&val), SessionState::Idle);
+    }
+
+    #[test]
+    fn state_assistant_content_not_array() {
+        let val = json!({
+            "type": "assistant",
+            "message": {"content": "just a string"}
+        });
+        assert_eq!(state_from_json(&val), SessionState::Idle);
+    }
+
+    #[test]
+    fn state_assistant_empty_content_array() {
+        let val = json!({
+            "type": "assistant",
+            "message": {"content": [], "stop_reason": null}
+        });
+        // Empty content, still streaming → thinking
+        assert_eq!(state_from_json(&val), SessionState::Thinking);
+    }
+
+    #[test]
+    fn extract_activity_all_unparseable() {
+        let parsed: Vec<Option<Value>> = vec![None, None, None];
+        assert_eq!(extract_activity_from_parsed(&parsed), "working");
+    }
+
+    #[test]
+    fn extract_activity_empty_input() {
+        let parsed: Vec<Option<Value>> = vec![];
+        assert_eq!(extract_activity_from_parsed(&parsed), "working");
+    }
+
+    #[test]
+    fn extract_tool_names_missing_content() {
+        let val = json!({"type": "assistant", "message": {}});
+        assert_eq!(extract_tool_names(&val), "working");
+    }
+
+    #[test]
+    fn extract_tool_names_empty_content() {
+        let val = json!({
+            "type": "assistant",
+            "message": {"content": []}
+        });
+        assert_eq!(extract_tool_names(&val), "working");
+    }
+
+    #[test]
+    fn extract_tool_names_no_tool_use_blocks() {
+        let val = json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "hi"}]}
+        });
+        assert_eq!(extract_tool_names(&val), "working");
+    }
 }

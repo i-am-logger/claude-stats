@@ -8,13 +8,13 @@ use ratatui::{
     Frame,
 };
 
-pub struct IndicatorDots {
-    pub fetching: bool,
-    pub health: Option<HealthStatus>,
+pub(super) struct IndicatorDots {
+    pub(super) fetching: bool,
+    pub(super) health: Option<HealthStatus>,
 }
 
 impl IndicatorDots {
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         if area.width < 4 {
             return;
         }

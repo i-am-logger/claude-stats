@@ -14,22 +14,22 @@ const SLOW_API_THRESHOLD: Duration = Duration::from_secs(3);
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Default)]
-pub struct State {
-    pub usage: Option<UsageData>,
-    pub sessions: Vec<SessionData>,
-    pub status: Option<StatusData>,
-    pub error: Option<FetchError>,
-    pub status_error: Option<FetchError>,
-    pub health: Option<HealthStatus>,
-    pub fetching: bool,
-    pub plan: Option<Plan>,
-    pub tick: u64,
+pub(crate) struct State {
+    pub(crate) usage: Option<UsageData>,
+    pub(crate) sessions: Vec<SessionData>,
+    pub(crate) status: Option<StatusData>,
+    pub(crate) error: Option<FetchError>,
+    pub(crate) status_error: Option<FetchError>,
+    pub(crate) health: Option<HealthStatus>,
+    pub(crate) fetching: bool,
+    pub(crate) plan: Option<Plan>,
+    pub(crate) tick: u64,
 }
 
 impl State {
     /// Process a single event, updating state accordingly.
     /// Returns `true` when the application should shut down.
-    pub fn handle(&mut self, event: AppEvent) -> bool {
+    pub(crate) fn handle(&mut self, event: AppEvent) -> bool {
         match event {
             AppEvent::UsageFetching => {
                 self.fetching = true;
@@ -84,36 +84,26 @@ impl State {
     }
 }
 
-pub struct App {
+pub(crate) struct App {
     state: State,
     rx: EventRx,
     _workers: Vec<JoinHandle<()>>,
 }
 
 impl App {
-    pub async fn new() -> Result<Self> {
+    pub(crate) async fn new() -> Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        let initial_plan = tokio::task::spawn_blocking(crate::credentials::get_credentials)
-            .await
-            .unwrap_or_else(|e| {
-                if e.is_panic() {
-                    std::panic::resume_unwind(e.into_panic());
-                }
-                Err(crate::error::CredentialError::FileNotFound)
-            })
-            .ok()
-            .and_then(|c| c.plan);
+        let initial_plan = crate::workers::blocking(
+            crate::credentials::get_credentials,
+            Err(crate::error::CredentialError::FileNotFound),
+        )
+        .await
+        .ok()
+        .and_then(|c| c.plan);
 
         let initial_sessions =
-            tokio::task::spawn_blocking(crate::data::sessions::scan_active_sessions)
-                .await
-                .unwrap_or_else(|e| {
-                    if e.is_panic() {
-                        std::panic::resume_unwind(e.into_panic());
-                    }
-                    Vec::new()
-                });
+            crate::workers::blocking(crate::data::sessions::scan_active_sessions, Vec::new()).await;
 
         let state = State {
             usage: None,
@@ -138,7 +128,7 @@ impl App {
         })
     }
 
-    pub async fn run(
+    pub(crate) async fn run(
         &mut self,
         mut terminal: Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
@@ -158,9 +148,12 @@ impl App {
                 }
             }
 
-            // Drain pending events before next render
-            while let Ok(event) = self.rx.try_recv() {
-                self.handle(event);
+            // Drain pending events before next render (bounded to prevent UI stutter)
+            for _ in 0..10 {
+                match self.rx.try_recv() {
+                    Ok(event) => self.handle(event),
+                    Err(_) => break,
+                }
             }
         }
         Ok(())
@@ -199,12 +192,12 @@ fn install_signal_handler(tx: &EventTx) {
                 _ = sigterm.recv() => {}
                 _ = sigint.recv() => {}
             }
-            let _ = tx.send(AppEvent::Shutdown).await;
+            drop(tx.send(AppEvent::Shutdown).await);
         }
         #[cfg(not(unix))]
         {
             if tokio::signal::ctrl_c().await.is_ok() {
-                let _ = tx.send(AppEvent::Shutdown).await;
+                drop(tx.send(AppEvent::Shutdown).await);
             }
         }
     });
@@ -228,7 +221,7 @@ fn spawn_input_reader(tx: &EventTx) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::incidents::{StatusData, StatusIndicator, StatusSummary};
+    use crate::data::incidents::{StatusIndicator, StatusSummary};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn make_key(code: KeyCode) -> AppEvent {
