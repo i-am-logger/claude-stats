@@ -21,27 +21,9 @@ fn indicator_color(indicator: StatusIndicator) -> Color {
     }
 }
 
-impl Section for StatusSection<'_> {
-    fn height(&self, _width: u16) -> u16 {
-        let Some(sd) = self.status else { return 0 };
-        let mut h: u16 = 1; // header
-        if !sd.incidents.is_empty() {
-            h += 1; // blank
-            for incident in &sd.incidents {
-                h += 1; // title row
-                if incident.latest_body().is_some() {
-                    h += 1; // body row
-                }
-                h += 1; // timing row
-            }
-        }
-        h += 1; // spacer
-        h
-    }
-
-    fn render(&self, frame: &mut Frame, area: Rect) {
-        let Some(sd) = self.status else { return };
-
+impl StatusSection<'_> {
+    fn constraints(&self) -> Option<Vec<Constraint>> {
+        let sd = self.status.as_ref()?;
         let mut constraints = Vec::new();
         constraints.push(Constraint::Length(1)); // header
         if !sd.incidents.is_empty() {
@@ -55,6 +37,20 @@ impl Section for StatusSection<'_> {
             }
         }
         constraints.push(Constraint::Length(1)); // spacer
+        Some(constraints)
+    }
+}
+
+impl Section for StatusSection<'_> {
+    fn height(&self, _width: u16) -> u16 {
+        self.constraints().map_or(0, |c| c.len() as u16)
+    }
+
+    fn render(&self, frame: &mut Frame, area: Rect) {
+        let Some(sd) = self.status else { return };
+        let Some(constraints) = self.constraints() else {
+            return;
+        };
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

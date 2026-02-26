@@ -10,7 +10,7 @@ pub enum AppEvent {
     UsageUpdated {
         data: Result<UsageData, FetchError>,
         elapsed: Duration,
-        plan: Option<String>,
+        plan: Option<crate::credentials::Plan>,
     },
     StatusUpdated(Result<StatusData, FetchError>),
     SessionsUpdated(Vec<SessionData>),

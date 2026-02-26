@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 pub struct HeaderSection<'a> {
-    pub plan: &'a Option<String>,
+    pub plan: &'a Option<crate::credentials::Plan>,
 }
 
 impl Section for HeaderSection<'_> {

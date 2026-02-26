@@ -96,11 +96,7 @@ fn scan_tail_window(file: &fs::File, file_len: u64, tail_bytes: u64) -> TailStat
             continue;
         }
 
-        if !line.contains("\"type\":\"assistant\"") || line.contains("\"type\":\"progress\"") {
-            continue;
-        }
-
-        if !line.contains("\"usage\"") {
+        if !is_usage_line(&line) {
             continue;
         }
 
@@ -120,6 +116,16 @@ fn scan_tail_window(file: &fs::File, file_len: u64, tail_bytes: u64) -> TailStat
         last_tokens,
         compactions,
     }
+}
+
+/// Fast pre-filter: returns `true` when a raw JSONL line looks like an
+/// assistant message that carries a `usage` object. Used by both the main
+/// tail scanner and the subagent reader to skip irrelevant lines cheaply
+/// before attempting JSON parsing.
+pub(super) fn is_usage_line(line: &str) -> bool {
+    line.contains("\"type\":\"assistant\"")
+        && !line.contains("\"type\":\"progress\"")
+        && line.contains("\"usage\"")
 }
 
 pub(super) fn extract_tokens(usage: &serde_json::Value) -> u64 {
@@ -156,10 +162,6 @@ pub(super) fn read_last_lines(file: &fs::File, file_len: u64, count: usize) -> V
         }
     }
     lines.into()
-}
-
-pub(super) fn read_last_line(file: &fs::File, file_len: u64) -> Option<String> {
-    read_last_lines(file, file_len, 1).into_iter().next()
 }
 
 pub(super) fn truncate_str(s: &str, max: usize) -> String {
@@ -249,5 +251,29 @@ mod tests {
     #[test]
     fn parse_json_line_empty() {
         assert!(parse_json_line("").is_none());
+    }
+
+    #[test]
+    fn is_usage_line_matches_assistant_with_usage() {
+        let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":10}}}"#;
+        assert!(is_usage_line(line));
+    }
+
+    #[test]
+    fn is_usage_line_rejects_progress() {
+        let line = r#"{"type":"progress","type":"assistant","usage":{}}"#;
+        assert!(!is_usage_line(line));
+    }
+
+    #[test]
+    fn is_usage_line_rejects_no_usage() {
+        let line = r#"{"type":"assistant","message":{"content":"hi"}}"#;
+        assert!(!is_usage_line(line));
+    }
+
+    #[test]
+    fn is_usage_line_rejects_user() {
+        let line = r#"{"type":"user","usage":{}}"#;
+        assert!(!is_usage_line(line));
     }
 }

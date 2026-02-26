@@ -104,6 +104,11 @@ pub fn scan_active_sessions() -> Vec<SessionData> {
     sessions
 }
 
+/// Parse a single session file into [`SessionData`].
+///
+/// The same `File` handle is shared (via `&File`) between `parse_session_metadata`,
+/// `parse_tail_stats`, and `detect_state_and_activity`. Each callee seeks to its
+/// required position before reading, so call order does not matter.
 fn parse_session(path: &Path, age_secs: u64) -> Option<SessionData> {
     let file = fs::File::open(path).ok()?;
     let file_len = file.metadata().ok()?.len();

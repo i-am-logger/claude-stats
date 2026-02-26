@@ -1,8 +1,8 @@
-use super::activity::state_from_line;
-use super::tail::{extract_tokens, parse_json_line, read_last_line, seek_tail, truncate_str};
+use super::activity::detect_state_from_tail;
+use super::tail::{extract_tokens, is_usage_line, parse_json_line, seek_tail, truncate_str};
 use super::SubagentData;
 use std::fs;
-use std::io::BufRead;
+use std::io::{BufRead, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -49,11 +49,10 @@ fn parse_subagent(path: &Path) -> Option<SubagentData> {
         return None;
     }
 
-    let task = read_subagent_task(path);
+    let task = read_subagent_task(&file);
     let (model_short, context_tokens) = read_subagent_usage(&file, file_len);
 
-    let last_line = read_last_line(&file, file_len)?;
-    let state = state_from_line(&last_line);
+    let state = detect_state_from_tail(&file, file_len);
 
     Some(SubagentData {
         task,
@@ -63,11 +62,12 @@ fn parse_subagent(path: &Path) -> Option<SubagentData> {
     })
 }
 
-fn read_subagent_task(path: &Path) -> String {
-    let Ok(file) = fs::File::open(path) else {
+fn read_subagent_task(file: &fs::File) -> String {
+    let mut file = file;
+    if file.seek(SeekFrom::Start(0)).is_err() {
         return String::new();
-    };
-    let reader = std::io::BufReader::new(file);
+    }
+    let reader = std::io::BufReader::new(&mut file);
 
     for line in reader.lines().take(3).map_while(Result::ok) {
         if !line.contains("\"type\":\"user\"") {
@@ -101,10 +101,7 @@ fn read_subagent_usage(file: &fs::File, file_len: u64) -> (String, u64) {
     let mut tokens: u64 = 0;
 
     for line in reader.lines().map_while(Result::ok) {
-        if !line.contains("\"type\":\"assistant\"") || line.contains("\"type\":\"progress\"") {
-            continue;
-        }
-        if !line.contains("\"usage\"") {
+        if !is_usage_line(&line) {
             continue;
         }
         let Some(val) = parse_json_line(&line) else {

@@ -26,7 +26,7 @@ impl IndicatorDots {
             Some(HealthStatus::Error) => Color::Red,
             None => DIM,
         };
-        let dot_area = Rect::new(area.width - 4, 0, 4, 1);
+        let dot_area = Rect::new(area.x + area.width.saturating_sub(4), area.y, 4, 1);
         let dots = Paragraph::new(Line::from(vec![
             Span::styled("●", Style::default().fg(activity_color)),
             Span::raw(" "),

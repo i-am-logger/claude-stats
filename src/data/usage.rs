@@ -23,7 +23,8 @@ pub struct UsageLimit {
 
 impl UsageLimit {
     pub fn percent(&self) -> u16 {
-        self.utilization.map_or(0, |u| u.round() as u16)
+        self.utilization
+            .map_or(0, |u| u.round().clamp(0.0, 100.0) as u16)
     }
 
     /// Seconds remaining until reset, or None if no reset time.
@@ -42,7 +43,7 @@ impl UsageLimit {
             return String::new();
         };
 
-        if secs <= 0 {
+        if secs == 0 {
             "now".to_string()
         } else {
             crate::fmt::format_duration(secs)
@@ -57,7 +58,6 @@ pub async fn fetch_usage(
     let resp = client
         .get(USAGE_API_URL)
         .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
         .header("anthropic-beta", ANTHROPIC_BETA)
         .send()
         .await?;
@@ -88,6 +88,21 @@ mod tests {
     #[test]
     fn percent_none_utilization() {
         assert_eq!(limit(None, None).percent(), 0);
+    }
+
+    #[test]
+    fn percent_clamped_above_100() {
+        assert_eq!(limit(Some(150.0), None).percent(), 100);
+    }
+
+    #[test]
+    fn percent_clamped_negative() {
+        assert_eq!(limit(Some(-5.0), None).percent(), 0);
+    }
+
+    #[test]
+    fn percent_boundary_100() {
+        assert_eq!(limit(Some(100.0), None).percent(), 100);
     }
 
     #[test]

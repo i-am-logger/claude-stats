@@ -19,7 +19,12 @@ pub fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()
 
             let creds_result = tokio::task::spawn_blocking(credentials::get_credentials)
                 .await
-                .unwrap_or(Err(CredentialError::FileNotFound));
+                .unwrap_or_else(|e| {
+                    if e.is_panic() {
+                        std::panic::resume_unwind(e.into_panic());
+                    }
+                    Err(CredentialError::FileNotFound)
+                });
 
             match creds_result {
                 Ok(creds) => {

@@ -20,9 +20,9 @@ impl Section for ContextsSection<'_> {
         }
         let mut h: u16 = 2; // header + blank
         for session in self.sessions {
-            h += 4; // title + bar + info + state
-            h += session.agents.len() as u16;
-            h += 1; // spacer
+            h = h.saturating_add(4); // title + bar + info + state
+            h = h.saturating_add(session.agents.len() as u16);
+            h = h.saturating_add(1); // spacer
         }
         h
     }
@@ -91,8 +91,7 @@ fn render_title_row(session: &SessionData, tick: u64, frame: &mut Frame, area: R
             let frame_idx = (tick as usize) % SPINNER.len();
             let color = match session.state {
                 SessionState::Thinking => Color::Cyan,
-                SessionState::Working => Color::Green,
-                SessionState::Idle => DIM,
+                _ => Color::Green,
             };
             (SPINNER[frame_idx].to_string(), color)
         }
