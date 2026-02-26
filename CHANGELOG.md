@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/i-am-logger/claude-stats/compare/v1.0.0...v1.1.0) (2026-02-26)
+
+
+### Features
+
+* show account email and Claude Code version in header ([257d6e1](https://github.com/i-am-logger/claude-stats/commit/257d6e15e9c518313fe56d37e07ac65e3de1fe44))
+
 ## [1.0.0](https://github.com/i-am-logger/claude-stats/compare/v0.2.0...v1.0.0) (2026-02-26)
 
 
