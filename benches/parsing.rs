@@ -83,12 +83,13 @@ fn bench_scan_from_offset(c: &mut Criterion) {
 }
 
 fn bench_detect_state_and_activity(c: &mut Criterion) {
-    let lines = vec![
+    let lines: std::collections::VecDeque<String> = [
         user_line().to_string(),
         assistant_usage_line(50_000),
         tool_use_line().to_string(),
         progress_line().to_string(),
-    ];
+    ]
+    .into();
     c.bench_function("detect_state_and_activity", |b| {
         b.iter(|| detect_state_and_activity(black_box(&lines)));
     });

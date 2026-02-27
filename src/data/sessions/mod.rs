@@ -4,10 +4,11 @@
 )]
 
 pub mod activity;
+mod process;
 pub mod subagents;
 pub mod tail;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -19,7 +20,7 @@ pub use tail::CONTEXT_WINDOW;
 const MAX_AGE_SECS: u64 = 60;
 
 /// How many bytes from the end of a session file to read when extracting
-/// recent lines (64 KB). Shared by `read_last_lines` and subagent scanning.
+/// recent lines (64 KB). Used by `read_last_lines` and subagent scanning.
 pub(crate) const RECENT_TAIL_BYTES: u64 = 64_000;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,7 @@ pub struct SubagentData {
     pub task: String,
     pub model: ModelShort,
     pub context_tokens: u64,
+    /// Used for display only; active/completed filtering uses parent JSONL tracking.
     pub state: SessionState,
 }
 
@@ -79,7 +81,47 @@ struct CachedEntry {
     git_branch: String,
     last_tokens: u64,
     compactions: u32,
+    last_lines: VecDeque<String>,
     bytes_read: u64,
+    /// `agentId` → `parentToolUseID` mapping from `agent_progress` entries.
+    agent_tool_map: HashMap<String, String>,
+    /// Set of `tool_use_id` values that have received a `tool_result`.
+    completed_tool_ids: HashSet<String>,
+}
+
+impl CachedEntry {
+    fn from_scan(data: tail::SessionFileData, file_len: u64) -> Self {
+        Self {
+            cwd: data.cwd,
+            git_branch: data.git_branch,
+            last_tokens: data.last_tokens,
+            compactions: data.compactions,
+            last_lines: data.last_lines,
+            bytes_read: file_len,
+            agent_tool_map: data.agent_tool_map,
+            completed_tool_ids: data.completed_tool_ids,
+        }
+    }
+}
+
+/// Data returned from `read_session_file` to `parse_session`. Deliberately
+/// excludes agent tracking fields — those are merged directly into the
+/// `CachedEntry` and queried via `update_agent_tracking`.
+struct SessionFileResult {
+    cwd: String,
+    git_branch: String,
+    last_tokens: u64,
+    compactions: u32,
+    last_lines: VecDeque<String>,
+}
+
+/// Compute the set of agent IDs that are still active (have `agent_progress`
+/// entries but no corresponding `tool_result`).
+fn active_agent_ids(map: &HashMap<String, String>, completed: &HashSet<String>) -> HashSet<String> {
+    map.iter()
+        .filter(|(_, tool_id)| !completed.contains(*tool_id))
+        .map(|(agent_id, _)| agent_id.clone())
+        .collect()
 }
 
 /// Caches session file state across polls. First encounter does a full read;
@@ -108,6 +150,7 @@ impl SessionCache {
             return Vec::new();
         }
 
+        let active_dirs = process::active_project_dirs();
         let now = SystemTime::now();
         let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
 
@@ -121,9 +164,23 @@ impl SessionCache {
                 continue;
             }
 
+            let has_process =
+                process::AVAILABLE && active_dirs.contains(&project_entry.file_name());
+
+            // When process detection is available, skip projects without a
+            // running claude process.
+            if process::AVAILABLE && !has_process {
+                continue;
+            }
+
             let Ok(entries) = fs::read_dir(&project_path) else {
                 continue;
             };
+
+            // Track the most recently modified session file for this project.
+            // When process detection is active, only the newest file is the
+            // live session — older files are past conversations.
+            let mut newest: Option<(u64, PathBuf)> = None;
 
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -143,9 +200,19 @@ impl SessionCache {
                     .unwrap_or(Duration::MAX)
                     .as_secs();
 
-                if age < MAX_AGE_SECS {
+                if has_process {
+                    // Process alive: keep only the most recently modified file.
+                    if newest.as_ref().is_none_or(|(prev_age, _)| age < *prev_age) {
+                        newest = Some((age, path));
+                    }
+                } else if age < MAX_AGE_SECS {
+                    // No process / non-Linux fallback: mtime filter.
                     candidates.push((age, path));
                 }
+            }
+
+            if let Some(entry) = newest {
+                candidates.push(entry);
             }
         }
 
@@ -155,12 +222,73 @@ impl SessionCache {
             .collect();
 
         // Prune cache entries for sessions no longer active
-        let active: std::collections::HashSet<&PathBuf> =
-            candidates.iter().map(|(_, p)| p).collect();
+        let active: HashSet<&PathBuf> = candidates.iter().map(|(_, p)| p).collect();
         self.entries.retain(|k, _| active.contains(k));
 
         sessions.sort_by(|a, b| a.title.cmp(&b.title));
         sessions
+    }
+
+    /// Full-scan the file, cache the result, and return the session data.
+    fn full_scan_and_cache(
+        &mut self,
+        path: &Path,
+        file: &fs::File,
+        file_len: u64,
+    ) -> Option<SessionFileResult> {
+        let data = tail::scan_session_file(file)?;
+        self.entries
+            .insert(path.to_path_buf(), CachedEntry::from_scan(data, file_len));
+        Some(Self::result_from_cache(self.entries.get(path)?))
+    }
+
+    /// Build a `SessionFileResult` from the cached entry (no I/O).
+    fn result_from_cache(cached: &CachedEntry) -> SessionFileResult {
+        SessionFileResult {
+            cwd: cached.cwd.clone(),
+            git_branch: cached.git_branch.clone(),
+            last_tokens: cached.last_tokens,
+            compactions: cached.compactions,
+            last_lines: cached.last_lines.clone(),
+        }
+    }
+
+    /// Read session file data using cache. Returns parsed data or `None` if
+    /// the file can't be parsed.
+    fn read_session_file(
+        &mut self,
+        path: &Path,
+        file: &fs::File,
+        file_len: u64,
+    ) -> Option<SessionFileResult> {
+        if let Some(cached) = self.entries.get_mut(path) {
+            match file_len.cmp(&cached.bytes_read) {
+                std::cmp::Ordering::Less => {
+                    self.entries.remove(path);
+                    self.full_scan_and_cache(path, file, file_len)
+                }
+                std::cmp::Ordering::Greater => {
+                    let result = tail::scan_from_offset(file, cached.bytes_read);
+                    cached.compactions += result.compactions;
+                    if result.last_tokens > 0 || result.compactions > 0 {
+                        cached.last_tokens = result.last_tokens;
+                    }
+                    cached.last_lines.extend(result.last_lines);
+                    while cached.last_lines.len() > tail::RECENT_LINES {
+                        cached.last_lines.pop_front();
+                    }
+                    cached.bytes_read = file_len;
+                    for (agent_id, tool_id) in result.agent_tool_map {
+                        cached.agent_tool_map.entry(agent_id).or_insert(tool_id);
+                    }
+                    cached.completed_tool_ids.extend(result.completed_tool_ids);
+                    Some(Self::result_from_cache(cached))
+                }
+                std::cmp::Ordering::Equal => Some(Self::result_from_cache(cached)),
+            }
+        } else {
+            self.full_scan_and_cache(path, file, file_len)
+        }
     }
 
     /// Parse a single session file, using cached state when available.
@@ -168,96 +296,28 @@ impl SessionCache {
         let file = fs::File::open(path).ok()?;
         let file_len = file.metadata().ok()?.len();
 
-        let (cwd, git_branch, context_tokens, compactions, last_lines) =
-            if let Some(cached) = self.entries.get_mut(path) {
-                match file_len.cmp(&cached.bytes_read) {
-                    std::cmp::Ordering::Less => {
-                        // File shrank (truncated/recreated): discard cache, full re-read
-                        self.entries.remove(path);
-                        let data = tail::scan_session_file(&file)?;
-                        let result = (
-                            data.cwd.clone(),
-                            data.git_branch.clone(),
-                            data.last_tokens,
-                            data.compactions,
-                            data.last_lines,
-                        );
-                        self.entries.insert(
-                            path.to_path_buf(),
-                            CachedEntry {
-                                cwd: data.cwd,
-                                git_branch: data.git_branch,
-                                last_tokens: data.last_tokens,
-                                compactions: data.compactions,
-                                bytes_read: file_len,
-                            },
-                        );
-                        result
-                    }
-                    std::cmp::Ordering::Greater => {
-                        // File grew: scan only the new bytes
-                        let result = tail::scan_from_offset(&file, cached.bytes_read);
-                        cached.compactions += result.compactions;
-                        if result.last_tokens > 0 || result.compactions > 0 {
-                            cached.last_tokens = result.last_tokens;
-                        }
-                        cached.bytes_read = file_len;
-                        (
-                            cached.cwd.clone(),
-                            cached.git_branch.clone(),
-                            cached.last_tokens,
-                            cached.compactions,
-                            result.last_lines,
-                        )
-                    }
-                    std::cmp::Ordering::Equal => {
-                        // File unchanged: reuse cached stats, read last lines for state
-                        let last_lines = tail::read_last_lines(&file, file_len, 5);
-                        (
-                            cached.cwd.clone(),
-                            cached.git_branch.clone(),
-                            cached.last_tokens,
-                            cached.compactions,
-                            last_lines,
-                        )
-                    }
-                }
-            } else {
-                // First encounter: full read
-                let data = tail::scan_session_file(&file)?;
-                let path_buf = path.to_path_buf();
-                let result = (
-                    data.cwd.clone(),
-                    data.git_branch.clone(),
-                    data.last_tokens,
-                    data.compactions,
-                    data.last_lines,
-                );
-                self.entries.insert(
-                    path_buf,
-                    CachedEntry {
-                        cwd: data.cwd,
-                        git_branch: data.git_branch,
-                        last_tokens: data.last_tokens,
-                        compactions: data.compactions,
-                        bytes_read: file_len,
-                    },
-                );
-                result
-            };
+        let sfr = self.read_session_file(path, &file, file_len)?;
 
-        let title = Path::new(&cwd)
+        let title = Path::new(&sfr.cwd)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(&cwd)
+            .unwrap_or(&sfr.cwd)
             .to_string();
 
+        let (session_state, act) = activity::detect_state_and_activity(&sfr.last_lines);
+
+        // Only scan subagents when the parent session is actively working.
+        // Determine which agents are truly active by checking the parent
+        // JSONL for tool_result completion entries — purely deterministic.
         let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
-        let agents = subagents::scan_subagents(&subagents_dir);
-
-        let (session_state, act) = activity::detect_state_and_activity(&last_lines);
-        let context_percent = ((context_tokens.min(CONTEXT_WINDOW) * 100) / CONTEXT_WINDOW) as u16;
+        let agents = if session_state == SessionState::Working {
+            let active_ids = self.update_agent_tracking(path);
+            subagents::scan_subagents(&subagents_dir, &active_ids)
+        } else {
+            Vec::new()
+        };
+        let context_percent = ((sfr.last_tokens.min(CONTEXT_WINDOW) * 100) / CONTEXT_WINDOW) as u16;
 
         let last_activity_label = format!(
             "{} ago",
@@ -266,22 +326,32 @@ impl SessionCache {
 
         Some(SessionData {
             title,
-            git_branch,
-            context_tokens,
+            git_branch: sfr.git_branch,
+            context_tokens: sfr.last_tokens,
             context_percent,
             agents,
-            compactions,
+            compactions: sfr.compactions,
             last_activity_label,
             state: session_state,
             activity: act,
         })
+    }
+
+    /// Returns the set of agent IDs that are still active based on cached data.
+    /// Agent tracking data is now collected during `read_session_file` scans,
+    /// so this method performs no file I/O.
+    fn update_agent_tracking(&self, path: &Path) -> HashSet<String> {
+        let Some(cached) = self.entries.get(path) else {
+            return HashSet::new();
+        };
+        active_agent_ids(&cached.agent_tool_map, &cached.completed_tool_ids)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Seek, Write};
+    use std::io::{Seek, SeekFrom, Write};
 
     /// Write lines to a temp file and return the `File` handle (rewound to start).
     fn jsonl_file(lines: &[&str]) -> tempfile::NamedTempFile {
@@ -572,7 +642,7 @@ mod tests {
 
         // Truncate and rewrite with different content
         f.as_file().set_len(0).unwrap();
-        f.as_file().seek(std::io::SeekFrom::Start(0)).unwrap();
+        f.as_file().seek(SeekFrom::Start(0)).unwrap();
         let usage2 = assistant_usage_line(5_000);
         writeln!(&f, "{user_line}").unwrap();
         writeln!(&f, "{usage2}").unwrap();
@@ -582,5 +652,243 @@ mod tests {
         let session = cache.parse_session(f.path(), 1).unwrap();
         assert_eq!(session.context_tokens, 5_000);
         assert_eq!(session.compactions, 0);
+    }
+
+    // ── active agent tracking ─────────────────────────────────
+
+    fn progress_line(agent_id: &str, tool_use_id: &str) -> String {
+        format!(
+            r#"{{"type":"progress","parentToolUseID":"{tool_use_id}","data":{{"type":"agent_progress","agentId":"{agent_id}"}}}}"#
+        )
+    }
+
+    fn tool_result_line(tool_use_id: &str) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool_use_id}","content":"done"}}]}}}}"#
+        )
+    }
+
+    /// Helper: scan a temp file from offset 0 and return the set of active
+    /// agent IDs using `scan_from_offset` + `active_agent_ids`.
+    fn active_ids_from(f: &tempfile::NamedTempFile) -> HashSet<String> {
+        let result = tail::scan_from_offset(f.as_file(), 0);
+        active_agent_ids(&result.agent_tool_map, &result.completed_tool_ids)
+    }
+
+    #[test]
+    fn active_agents_no_entries() {
+        let f = jsonl_file(&[r#"{"type":"user","cwd":"/tmp","message":{"content":"hi"}}"#]);
+        assert!(active_ids_from(&f).is_empty());
+    }
+
+    #[test]
+    fn active_agents_one_running() {
+        let progress = progress_line("abc123", "toolu_001");
+        let f = jsonl_file(&[&progress]);
+        let ids = active_ids_from(&f);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("abc123"));
+    }
+
+    #[test]
+    fn active_agents_one_completed() {
+        let progress = progress_line("abc123", "toolu_001");
+        let result = tool_result_line("toolu_001");
+        let f = jsonl_file(&[&progress, &result]);
+        assert!(active_ids_from(&f).is_empty());
+    }
+
+    #[test]
+    fn active_agents_mixed() {
+        let p1 = progress_line("agent_a", "toolu_001");
+        let p2 = progress_line("agent_b", "toolu_002");
+        let r1 = tool_result_line("toolu_001");
+        let f = jsonl_file(&[&p1, &p2, &r1]);
+        let ids = active_ids_from(&f);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("agent_b"));
+        assert!(!ids.contains("agent_a"));
+    }
+
+    #[test]
+    fn active_agents_multiple_progress_same_agent() {
+        let p1 = progress_line("agent_a", "toolu_001");
+        let p2 = progress_line("agent_a", "toolu_001");
+        let f = jsonl_file(&[&p1, &p2]);
+        let ids = active_ids_from(&f);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("agent_a"));
+    }
+
+    #[test]
+    fn active_agents_all_completed() {
+        let p1 = progress_line("agent_a", "toolu_001");
+        let p2 = progress_line("agent_b", "toolu_002");
+        let r1 = tool_result_line("toolu_001");
+        let r2 = tool_result_line("toolu_002");
+        let f = jsonl_file(&[&p1, &p2, &r1, &r2]);
+        assert!(active_ids_from(&f).is_empty());
+    }
+
+    #[test]
+    fn active_agents_incremental_scan() {
+        let user_line =
+            r#"{"type":"user","cwd":"/tmp/proj","gitBranch":"main","message":{"content":"go"}}"#;
+        let usage = assistant_usage_line(10_000);
+        let p1 = progress_line("agent_a", "toolu_001");
+        let p2 = progress_line("agent_b", "toolu_002");
+        let tool_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],"stop_reason":null}}"#;
+
+        let f = jsonl_file(&[user_line, &usage, &p1, &p2, tool_use]);
+        let mut cache = SessionCache::new();
+
+        // First parse (full scan): both agents tracked in cache
+        let _session = cache.parse_session(f.path(), 1).unwrap();
+        let cached = cache.entries.get(f.path()).unwrap();
+        assert_eq!(cached.agent_tool_map.len(), 2);
+        assert!(cached.completed_tool_ids.is_empty());
+
+        // Append a tool_result for agent_a
+        let r1 = tool_result_line("toolu_001");
+        writeln!(&f, "{r1}").unwrap();
+        f.as_file().sync_all().unwrap();
+
+        // Second parse (incremental): cache merges the new tool_result
+        let _session = cache.parse_session(f.path(), 1).unwrap();
+        let cached = cache.entries.get(f.path()).unwrap();
+        assert_eq!(cached.agent_tool_map.len(), 2);
+        assert!(cached.completed_tool_ids.contains("toolu_001"));
+
+        let active = active_agent_ids(&cached.agent_tool_map, &cached.completed_tool_ids);
+        assert_eq!(active.len(), 1);
+        assert!(active.contains("agent_b"));
+    }
+
+    // ── edge case: malformed agent_progress ──────────────────────
+
+    #[test]
+    fn agent_tracking_malformed_progress() {
+        // Missing agentId field
+        let missing_agent_id =
+            r#"{"type":"progress","parentToolUseID":"toolu_001","data":{"type":"agent_progress"}}"#;
+        // Missing parentToolUseID field
+        let missing_tool_id =
+            r#"{"type":"progress","data":{"type":"agent_progress","agentId":"abc123"}}"#;
+        let f = jsonl_file(&[missing_agent_id, missing_tool_id]);
+        let ids = active_ids_from(&f);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn agent_tracking_tool_result_before_progress() {
+        // tool_result appears before any agent_progress — should be harmless
+        let result = tool_result_line("toolu_001");
+        let progress = progress_line("agent_a", "toolu_001");
+        let f = jsonl_file(&[&result, &progress]);
+        let ids = active_ids_from(&f);
+        // The tool_result was recorded before the progress, so the agent
+        // should still be marked as completed.
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn cache_file_shrink_resets_agent_data() {
+        let user_line =
+            r#"{"type":"user","cwd":"/tmp/proj","gitBranch":"main","message":{"content":"go"}}"#;
+        let progress = progress_line("agent_x", "toolu_099");
+        let usage = assistant_usage_line(10_000);
+        let tool_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],"stop_reason":null}}"#;
+
+        let f = jsonl_file(&[user_line, &progress, &usage, tool_use]);
+        let mut cache = SessionCache::new();
+
+        // First parse — agent_x should be in the cache
+        let _session = cache.parse_session(f.path(), 1).unwrap();
+        let cached = cache.entries.get(f.path()).unwrap();
+        assert!(cached.agent_tool_map.contains_key("agent_x"));
+
+        // Truncate and rewrite without agent data
+        f.as_file().set_len(0).unwrap();
+        f.as_file().seek(SeekFrom::Start(0)).unwrap();
+        let idle = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}}"#;
+        writeln!(&f, "{user_line}").unwrap();
+        writeln!(&f, "{}", &assistant_usage_line(5_000)).unwrap();
+        writeln!(&f, "{idle}").unwrap();
+        f.as_file().sync_all().unwrap();
+
+        // After shrink, agent maps should be rebuilt (empty)
+        let _session = cache.parse_session(f.path(), 1).unwrap();
+        let cached = cache.entries.get(f.path()).unwrap();
+        assert!(cached.agent_tool_map.is_empty());
+        assert!(cached.completed_tool_ids.is_empty());
+    }
+
+    // ── integration: parse_session with subagents ────────────────
+
+    #[test]
+    fn parse_session_with_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create parent session file
+        let session_id = "test-session-abc";
+        let parent_path = dir.path().join(format!("{session_id}.jsonl"));
+
+        let user_line = r#"{"type":"user","cwd":"/home/user/proj","gitBranch":"main","message":{"content":"go"}}"#;
+        let usage = assistant_usage_line(10_000);
+        let tool_use_a = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_001","name":"Task","input":{}}],"stop_reason":null}}"#;
+        let progress_a = progress_line("agent_active", "toolu_001");
+        let tool_use_b = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_002","name":"Task","input":{}}],"stop_reason":null}}"#;
+        let progress_b = progress_line("agent_done", "toolu_002");
+        let result_b = tool_result_line("toolu_002");
+        // End with working state (tool_use + progress)
+        let final_progress =
+            r#"{"type":"progress","data":{"type":"agent_progress","agentId":"agent_active"}}"#;
+
+        {
+            let mut f = fs::File::create(&parent_path).unwrap();
+            for line in &[
+                user_line,
+                &usage,
+                tool_use_a,
+                &progress_a,
+                tool_use_b,
+                &progress_b,
+                &result_b,
+                final_progress,
+            ] {
+                writeln!(f, "{line}").unwrap();
+            }
+            f.sync_all().unwrap();
+        }
+
+        // Create subagent files
+        let subagents_dir = dir.path().join(session_id).join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+
+        write_agent_file(&subagents_dir, "agent_active", "Search for tests", 5_000);
+        write_agent_file(&subagents_dir, "agent_done", "Run linter", 3_000);
+
+        // Parse session
+        let mut cache = SessionCache::new();
+        let session = cache.parse_session(&parent_path, 1).unwrap();
+
+        // Working state → agents should be scanned
+        assert_eq!(session.state, SessionState::Working);
+        // Only the active agent (not the completed one) should appear
+        assert_eq!(session.agents.len(), 1);
+        assert_eq!(session.agents[0].task, "Search for tests");
+    }
+
+    /// Write a minimal subagent JSONL file.
+    fn write_agent_file(subagents_dir: &Path, agent_id: &str, task: &str, tokens: u64) {
+        let path = subagents_dir.join(format!("agent-{agent_id}.jsonl"));
+        let user_line = format!(r#"{{"type":"user","message":{{"content":"{task}"}}}}"#);
+        let usage_line = format!(
+            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":{tokens}}},"content":[{{"type":"text","text":"ok"}}],"stop_reason":"end_turn"}}}}"#
+        );
+        let mut f = fs::File::create(path).unwrap();
+        writeln!(f, "{user_line}").unwrap();
+        writeln!(f, "{usage_line}").unwrap();
+        f.sync_all().unwrap();
     }
 }

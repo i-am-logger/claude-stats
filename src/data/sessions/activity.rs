@@ -7,6 +7,7 @@ use super::tail::{parse_json_line, read_last_lines};
 use super::SessionState;
 use crate::fmt::truncate_str;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::fs;
 
 /// Classification of JSONL line types. State-indicating lines (Progress,
@@ -24,7 +25,7 @@ enum LineKind {
 fn classify_line(val: &Value) -> LineKind {
     match val.get("type").and_then(|t| t.as_str()) {
         Some("progress") => LineKind::Progress,
-        Some("assistant") => LineKind::Assistant,
+        Some("assistant" | "message") => LineKind::Assistant,
         Some("system") => LineKind::System,
         Some("user") => LineKind::User,
         _ => LineKind::Metadata,
@@ -81,7 +82,7 @@ fn state_from_assistant(val: &Value) -> SessionState {
     }
 }
 
-pub fn detect_state_and_activity(lines: &[String]) -> (SessionState, String) {
+pub fn detect_state_and_activity(lines: &VecDeque<String>) -> (SessionState, String) {
     if lines.is_empty() {
         return (SessionState::Idle, String::new());
     }
@@ -253,6 +254,12 @@ mod tests {
     }
 
     #[test]
+    fn classify_message_as_assistant() {
+        let val = json!({"type": "message", "message": {"stop_reason": "end_turn"}});
+        assert_eq!(classify_line(&val), LineKind::Assistant);
+    }
+
+    #[test]
     fn classify_system() {
         let val = json!({"type": "system", "subtype": "turn_duration"});
         assert_eq!(classify_line(&val), LineKind::System);
@@ -379,6 +386,30 @@ mod tests {
             }
         });
         assert_eq!(state_from_json(&val), SessionState::Idle);
+    }
+
+    #[test]
+    fn state_message_type_complete_is_idle() {
+        let val = json!({
+            "type": "message",
+            "message": {
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn"
+            }
+        });
+        assert_eq!(state_from_json(&val), SessionState::Idle);
+    }
+
+    #[test]
+    fn state_message_type_streaming_is_thinking() {
+        let val = json!({
+            "type": "message",
+            "message": {
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": null
+            }
+        });
+        assert_eq!(state_from_json(&val), SessionState::Thinking);
     }
 
     #[test]
@@ -692,7 +723,7 @@ mod tests {
                 line_count in 0..=10_usize,
                 type_str in arb_type(),
             ) {
-                let lines: Vec<String> = (0..line_count)
+                let lines: VecDeque<String> = (0..line_count)
                     .map(|_| format!(r#"{{"type":"{}"}}"#, type_str))
                     .collect();
                 let (state, _activity) = detect_state_and_activity(&lines);

@@ -1,6 +1,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/i-am-logger/claude-stats)](https://github.com/i-am-logger/claude-stats/releases/latest)
 [![build](https://github.com/i-am-logger/claude-stats/actions/workflows/ci.yml/badge.svg)](https://github.com/i-am-logger/claude-stats/actions/workflows/ci.yml)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+[![codecov](https://codecov.io/gh/i-am-logger/claude-stats/branch/master/graph/badge.svg)](https://codecov.io/gh/i-am-logger/claude-stats)
 
 # claude-stats
 
