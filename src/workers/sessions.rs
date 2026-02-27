@@ -1,5 +1,6 @@
+use super::ResourceGuard;
 use crate::data::sessions;
-use crate::event::{AppEvent, EventTx};
+use crate::event::{AppEvent, EventTx, ResourceKind};
 use notify::{RecursiveMode, Watcher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,8 +16,12 @@ pub(crate) fn spawn(tx: EventTx) -> tokio::task::JoinHandle<()> {
         let dirty = Arc::new(AtomicBool::new(false));
         let watcher = setup_watcher(&dirty);
         let has_watcher = watcher.is_some();
+        if !has_watcher {
+            tracing::info!("filesystem watcher unavailable, falling back to polling");
+        }
         let _watcher = watcher; // prevent drop
 
+        let mut cache = sessions::SessionCache::new();
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         let mut poll_counter: u64 = 0;
         loop {
@@ -33,7 +38,18 @@ pub(crate) fn spawn(tx: EventTx) -> tokio::task::JoinHandle<()> {
             };
 
             if should_scan {
-                let data = super::blocking(sessions::scan_active_sessions, Vec::new()).await;
+                let (data, returned_cache) = {
+                    let _guard = ResourceGuard::acquire(&tx, ResourceKind::Disk);
+                    super::blocking(
+                        move || {
+                            let data = cache.scan();
+                            (data, cache)
+                        },
+                        (Vec::new(), sessions::SessionCache::new()),
+                    )
+                    .await
+                };
+                cache = returned_cache;
                 if tx.send(AppEvent::SessionsUpdated(data)).await.is_err() {
                     break;
                 }

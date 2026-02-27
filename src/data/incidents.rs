@@ -123,6 +123,123 @@ pub(crate) struct StatusData {
     pub(crate) incidents: Vec<Incident>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_time_just_now_under_60s() {
+        assert_eq!(relative_time(chrono::TimeDelta::seconds(0)), "just now");
+        assert_eq!(relative_time(chrono::TimeDelta::seconds(30)), "just now");
+        assert_eq!(relative_time(chrono::TimeDelta::seconds(59)), "just now");
+    }
+
+    #[test]
+    fn relative_time_boundary_at_60s() {
+        let result = relative_time(chrono::TimeDelta::seconds(60));
+        assert_eq!(result, "1m ago");
+    }
+
+    #[test]
+    fn relative_time_negative_clamped() {
+        assert_eq!(relative_time(chrono::TimeDelta::seconds(-10)), "just now");
+    }
+
+    #[test]
+    fn relative_time_hours() {
+        let result = relative_time(chrono::TimeDelta::seconds(7200));
+        assert_eq!(result, "2h ago");
+    }
+
+    fn make_incident(updates: Vec<IncidentUpdate>) -> Incident {
+        Incident {
+            name: "Test incident".into(),
+            status: IncidentStatus::Investigating,
+            impact: IncidentImpact::Minor,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            updates,
+        }
+    }
+
+    #[test]
+    fn latest_body_with_updates() {
+        let incident = make_incident(vec![IncidentUpdate {
+            body: "We are investigating".into(),
+            created_at: Utc::now(),
+        }]);
+        assert_eq!(incident.latest_body(), Some("We are investigating"));
+    }
+
+    #[test]
+    fn latest_body_no_updates() {
+        let incident = make_incident(vec![]);
+        assert_eq!(incident.latest_body(), None);
+    }
+
+    #[test]
+    fn started_ago_returns_string() {
+        let incident = make_incident(vec![]);
+        let result = incident.started_ago();
+        assert_eq!(result, "just now");
+    }
+
+    #[test]
+    fn updated_ago_uses_latest_update() {
+        let incident = make_incident(vec![IncidentUpdate {
+            body: "update".into(),
+            created_at: Utc::now(),
+        }]);
+        let result = incident.updated_ago();
+        assert_eq!(result, "just now");
+    }
+
+    #[test]
+    fn updated_ago_falls_back_to_updated_at() {
+        let incident = make_incident(vec![]);
+        let result = incident.updated_ago();
+        assert_eq!(result, "just now");
+    }
+
+    #[test]
+    fn incident_status_display() {
+        assert_eq!(IncidentStatus::Investigating.to_string(), "INVESTIGATING");
+        assert_eq!(IncidentStatus::Identified.to_string(), "IDENTIFIED");
+        assert_eq!(IncidentStatus::Monitoring.to_string(), "MONITORING");
+        assert_eq!(IncidentStatus::Postmortem.to_string(), "POSTMORTEM");
+        assert_eq!(IncidentStatus::Resolved.to_string(), "RESOLVED");
+        assert_eq!(IncidentStatus::Unknown.to_string(), "UNKNOWN");
+    }
+
+    #[test]
+    fn serde_incident_status() {
+        let s: IncidentStatus = serde_json::from_str(r#""investigating""#).unwrap();
+        assert_eq!(s, IncidentStatus::Investigating);
+    }
+
+    #[test]
+    fn serde_unknown_status_fallback() {
+        let s: IncidentStatus = serde_json::from_str(r#""some_new_status""#).unwrap();
+        assert_eq!(s, IncidentStatus::Unknown);
+    }
+
+    #[test]
+    fn serde_impact() {
+        let i: IncidentImpact = serde_json::from_str(r#""minor""#).unwrap();
+        assert_eq!(i, IncidentImpact::Minor);
+        let i: IncidentImpact = serde_json::from_str(r#""critical""#).unwrap();
+        assert_eq!(i, IncidentImpact::Critical);
+    }
+
+    #[test]
+    fn serde_status_indicator() {
+        let s: StatusIndicator = serde_json::from_str(r#""none""#).unwrap();
+        assert_eq!(s, StatusIndicator::None);
+        let s: StatusIndicator = serde_json::from_str(r#""major""#).unwrap();
+        assert_eq!(s, StatusIndicator::Major);
+    }
+}
+
 pub(crate) async fn fetch_status(
     client: &reqwest::Client,
 ) -> Result<StatusData, crate::error::FetchError> {

@@ -1,6 +1,7 @@
 use super::activity::detect_state_from_tail;
-use super::tail::{extract_tokens, is_usage_line, parse_json_line, seek_tail, truncate_str};
+use super::tail::{extract_tokens, is_assistant_usage, parse_json_line, seek_tail};
 use super::{ModelShort, SubagentData};
+use crate::fmt::truncate_str;
 use std::fs;
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::Path;
@@ -70,12 +71,12 @@ fn read_subagent_task(file: &fs::File) -> String {
     let reader = std::io::BufReader::new(&mut file);
 
     for line in reader.lines().take(3).map_while(Result::ok) {
-        if !line.contains("\"type\":\"user\"") {
-            continue;
-        }
         let Some(val) = parse_json_line(&line) else {
             continue;
         };
+        if val.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
         if let Some(content) = val.pointer("/message/content") {
             if let Some(s) = content.as_str() {
                 let trimmed = s.trim().lines().next().unwrap_or("").trim();
@@ -101,12 +102,12 @@ fn read_subagent_usage(file: &fs::File, file_len: u64) -> (ModelShort, u64) {
     let mut tokens: u64 = 0;
 
     for line in reader.lines().map_while(Result::ok) {
-        if !is_usage_line(&line) {
-            continue;
-        }
         let Some(val) = parse_json_line(&line) else {
             continue;
         };
+        if !is_assistant_usage(&val) {
+            continue;
+        }
         if let Some(usage) = val.pointer("/message/usage") {
             let total = extract_tokens(usage);
             if total > 0 {

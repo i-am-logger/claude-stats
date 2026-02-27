@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 const USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -14,10 +15,10 @@ pub(crate) struct UsageData {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct UsageLimit {
     #[serde(default)]
-    pub utilization: Option<f64>,
+    pub(crate) utilization: Option<f64>,
 
     #[serde(default)]
-    pub resets_at: Option<String>,
+    pub(crate) resets_at: Option<DateTime<Utc>>,
 }
 
 impl UsageLimit {
@@ -28,11 +29,8 @@ impl UsageLimit {
 
     /// Seconds remaining until reset, or None if no reset time.
     pub(crate) fn remaining_secs(&self) -> Option<i64> {
-        let ts = self.resets_at.as_ref()?;
-        let dt = chrono::DateTime::parse_from_rfc3339(ts)
-            .ok()?
-            .with_timezone(&chrono::Utc);
-        let secs = dt.signed_duration_since(chrono::Utc::now()).num_seconds();
+        let dt = self.resets_at.as_ref()?;
+        let secs = dt.signed_duration_since(Utc::now()).num_seconds();
         Some(secs.max(0))
     }
 
@@ -73,7 +71,8 @@ mod tests {
     fn limit(utilization: Option<f64>, resets_at: Option<&str>) -> UsageLimit {
         UsageLimit {
             utilization,
-            resets_at: resets_at.map(String::from),
+            resets_at: resets_at
+                .map(|s| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)),
         }
     }
 

@@ -7,6 +7,13 @@ use std::time::Duration;
 pub(crate) type EventTx = tokio::sync::mpsc::Sender<AppEvent>;
 pub(crate) type EventRx = tokio::sync::mpsc::Receiver<AppEvent>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ResourceKind {
+    Network,
+    Disk,
+}
+
+#[derive(Debug)]
 pub(crate) enum AppEvent {
     UsageFetching,
     UsageUpdated {
@@ -20,6 +27,8 @@ pub(crate) enum AppEvent {
     StatusUpdated(Result<StatusData, FetchError>),
     SessionsUpdated(Vec<SessionData>),
     ClaudeVersionUpdated(ClaudeVersion),
+    ResourceBusy(ResourceKind),
+    ResourceIdle(ResourceKind),
     Key(crossterm::event::KeyEvent),
     Shutdown,
 }

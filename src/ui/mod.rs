@@ -9,7 +9,7 @@ use crate::app::State;
 use common::Section;
 use contexts::ContextsSection;
 use header::HeaderSection;
-use indicators::IndicatorDots;
+use indicators::StatusLine;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     Frame,
@@ -35,7 +35,7 @@ pub(crate) fn render(state: &State, frame: &mut Frame<'_>) {
     let limits = UsageLimitsSection {
         usage: &state.usage,
         error: &state.error,
-        fetching: state.fetching,
+        fetching: state.usage_fetching,
     };
 
     let sections: Vec<&dyn Section> = vec![&header, &status, &contexts, &limits];
@@ -54,10 +54,11 @@ pub(crate) fn render(state: &State, frame: &mut Frame<'_>) {
         section.render(frame, chunks[idx]);
     }
 
-    // Overlay indicator dots last
-    let dots = IndicatorDots {
-        fetching: state.fetching,
-        health: state.health,
+    // Overlay status line last
+    let status_line = StatusLine {
+        net_active: state.net_active > 0,
+        disk_active: state.disk_active > 0,
+        health: state.health(),
     };
-    dots.render(frame, area);
+    status_line.render(frame, area);
 }

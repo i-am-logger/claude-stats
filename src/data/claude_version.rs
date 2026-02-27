@@ -45,9 +45,14 @@ pub(crate) fn get_installed_version() -> Option<String> {
 /// Extract a version number from `claude --version` output.
 /// Handles formats like "1.0.16", "claude 1.0.16", "claude v1.0.16".
 fn parse_version_output(stdout: &str) -> Option<&str> {
-    stdout
-        .split_whitespace()
-        .find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    stdout.split_whitespace().find_map(|s| {
+        if s.starts_with(|c: char| c.is_ascii_digit()) {
+            Some(s)
+        } else {
+            s.strip_prefix('v')
+                .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        }
+    })
 }
 
 pub(crate) async fn fetch_latest_version(client: &reqwest::Client) -> Result<String, FetchError> {
@@ -123,6 +128,16 @@ mod tests {
     #[test]
     fn parse_version_no_digits() {
         assert_eq!(parse_version_output("claude"), None);
+    }
+
+    #[test]
+    fn parse_version_v_prefix() {
+        assert_eq!(parse_version_output("v1.0.16"), Some("1.0.16"));
+    }
+
+    #[test]
+    fn parse_version_v_prefix_with_label() {
+        assert_eq!(parse_version_output("claude v1.0.16"), Some("1.0.16"));
     }
 
     #[test]

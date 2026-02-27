@@ -8,31 +8,35 @@ use ratatui::{
     Frame,
 };
 
-pub(super) struct IndicatorDots {
-    pub(super) fetching: bool,
-    pub(super) health: Option<HealthStatus>,
+pub(super) struct StatusLine {
+    pub(super) net_active: bool,
+    pub(super) disk_active: bool,
+    pub(super) health: HealthStatus,
 }
 
-impl IndicatorDots {
+impl StatusLine {
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width < 4 {
+        if area.width < 5 {
             return;
         }
 
-        let activity_color = if self.fetching { Color::Cyan } else { DIM };
-        let health_color = match self.health {
-            Some(HealthStatus::Ok) => Color::Green,
-            Some(HealthStatus::Slow) => Color::Yellow,
-            Some(HealthStatus::Error) => Color::Red,
-            None => DIM,
+        let net_color = if self.net_active { Color::Cyan } else { DIM };
+        let disk_color = if self.disk_active { Color::Cyan } else { DIM };
+        let (health_icon, health_color) = match self.health {
+            HealthStatus::Ok => ("\u{f012f}", Color::Green), // nf-md-checkbox_blank_circle
+            HealthStatus::Slow => ("\u{f0028}", Color::Yellow), // nf-md-alert_circle
+            HealthStatus::Error => ("\u{f0028}", Color::Red), // nf-md-alert_circle
         };
-        let dot_area = Rect::new(area.x + area.width.saturating_sub(4), area.y, 4, 1);
-        let dots = Paragraph::new(Line::from(vec![
-            Span::styled("●", Style::default().fg(activity_color)),
+
+        let status_area = Rect::new(area.x + area.width.saturating_sub(5), area.y, 5, 1);
+        let line = Paragraph::new(Line::from(vec![
+            Span::styled("\u{f059f}", Style::default().fg(net_color)),
             Span::raw(" "),
-            Span::styled("●", Style::default().fg(health_color)),
+            Span::styled("\u{f01bc}", Style::default().fg(disk_color)),
+            Span::raw(" "),
+            Span::styled(health_icon, Style::default().fg(health_color)),
         ]))
         .alignment(Alignment::Right);
-        frame.render_widget(dots, dot_area);
+        frame.render_widget(line, status_area);
     }
 }

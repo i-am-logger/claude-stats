@@ -1,5 +1,6 @@
-use super::tail::{parse_json_line, read_last_lines, truncate_str};
+use super::tail::{parse_json_line, read_last_lines};
 use super::SessionState;
+use crate::fmt::truncate_str;
 use serde_json::Value;
 use std::fs;
 
@@ -75,8 +76,7 @@ fn state_from_assistant(val: &Value) -> SessionState {
     }
 }
 
-pub(super) fn detect_state_and_activity(file: &fs::File, file_len: u64) -> (SessionState, String) {
-    let lines = read_last_lines(file, file_len, 5);
+pub(super) fn detect_state_and_activity(lines: &[String]) -> (SessionState, String) {
     if lines.is_empty() {
         return (SessionState::Idle, String::new());
     }

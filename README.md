@@ -19,7 +19,7 @@ A TUI dashboard for monitoring Claude Code usage limits and active sessions.
 - Claude Code version display with update indicator
 - Countdown timers showing when limits reset
 - Color-coded warnings at 70% and 85% utilization
-- Activity and health status indicators
+- Resource activity indicators (network, disk) and health status
 
 ## Install
 
@@ -36,6 +36,8 @@ claude-stats
 Press `q` or `Esc` to quit.
 
 Requires a valid Claude Code OAuth token in `~/.claude/.credentials.json`.
+
+A [Nerd Font](https://www.nerdfonts.com/) is required for status line icons.
 
 ## Development
 

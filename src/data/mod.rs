@@ -6,8 +6,9 @@ pub(crate) mod usage;
 
 pub(super) const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum HealthStatus {
+    #[default]
     Ok,
     Slow,
     Error,

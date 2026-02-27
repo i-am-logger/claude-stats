@@ -7,6 +7,9 @@ mod fmt;
 mod ui;
 mod workers;
 
+#[cfg(test)]
+use tempfile as _;
+
 use anyhow::{Context, Result};
 use crossterm::{
     execute,
@@ -17,6 +20,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
+    fs,
     io::{self, stdout, Write},
     panic,
 };
@@ -35,14 +39,42 @@ async fn main() -> Result<()> {
         }
     }
 
+    let _log_guard = init_logging();
+
     install_panic_hook();
+
+    tracing::info!("claude-stats v{VERSION} starting");
 
     let terminal = init_terminal().context("failed to initialize terminal")?;
     let mut app = app::App::new().await.context("failed to initialize app")?;
     let result = app.run(terminal).await;
 
     restore_terminal()?;
+    tracing::info!("claude-stats shutting down");
     result
+}
+
+/// Initialize file-based logging. Returns a guard that must be held for the
+/// lifetime of the program to ensure buffered logs are flushed on exit.
+fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
+    let log_dir = dirs::data_dir()
+        .unwrap_or_else(|| "/tmp".into())
+        .join("claude-stats");
+    drop(fs::create_dir_all(&log_dir));
+
+    let file_appender = tracing_appender::rolling::never(&log_dir, "claude-stats.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("claude_stats=info".parse().unwrap()),
+        )
+        .init();
+
+    guard
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

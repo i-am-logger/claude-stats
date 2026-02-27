@@ -4,7 +4,7 @@ use crate::data::{
     HealthStatus,
 };
 use crate::error::FetchError;
-use crate::event::{AppEvent, EventRx, EventTx};
+use crate::event::{AppEvent, EventRx, EventTx, ResourceKind};
 use crate::ui;
 use anyhow::{Context, Result};
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -23,42 +23,57 @@ pub(crate) struct State {
     pub(crate) status: Option<StatusData>,
     pub(crate) error: Option<FetchError>,
     pub(crate) status_error: Option<FetchError>,
-    pub(crate) health: Option<HealthStatus>,
-    pub(crate) fetching: bool,
+    pub(crate) usage_health: HealthStatus,
+    pub(crate) usage_fetching: bool,
     pub(crate) plan: Option<Plan>,
     pub(crate) account_email: Option<String>,
     pub(crate) claude_version: Option<ClaudeVersion>,
+    pub(crate) net_active: u8,
+    pub(crate) disk_active: u8,
     pub(crate) tick: u64,
 }
 
 impl State {
+    /// Composite health: worst-case across all error sources.
+    pub(crate) fn health(&self) -> HealthStatus {
+        let status_health = if self.status_error.is_some() {
+            HealthStatus::Error
+        } else {
+            HealthStatus::Ok
+        };
+        self.usage_health.max(status_health)
+    }
+
     /// Process a single event, updating state accordingly.
     /// Returns `true` when the application should shut down.
     pub(crate) fn handle(&mut self, event: AppEvent) -> bool {
         match event {
             AppEvent::UsageFetching => {
-                self.fetching = true;
+                self.usage_fetching = true;
             }
             AppEvent::UsageUpdated { data, elapsed } => {
                 match data {
                     Ok(data) => {
                         self.usage = Some(data);
                         self.error = None;
-                        self.health = if elapsed > SLOW_API_THRESHOLD {
-                            Some(HealthStatus::Slow)
+                        self.usage_health = if elapsed > SLOW_API_THRESHOLD {
+                            HealthStatus::Slow
                         } else {
-                            Some(HealthStatus::Ok)
+                            HealthStatus::Ok
                         };
                     }
                     Err(e) => {
                         self.error = Some(e);
-                        self.health = Some(HealthStatus::Error);
+                        self.usage_health = HealthStatus::Error;
                     }
                 }
-                self.fetching = false;
+                self.usage_fetching = false;
             }
             AppEvent::StatusUpdated(result) => match result {
-                Ok(data) => self.status = Some(data),
+                Ok(data) => {
+                    self.status = Some(data);
+                    self.status_error = None;
+                }
                 Err(e) => self.status_error = Some(e),
             },
             AppEvent::AccountUpdated { email, plan } => {
@@ -71,6 +86,22 @@ impl State {
             AppEvent::ClaudeVersionUpdated(version) => {
                 self.claude_version = Some(version);
             }
+            AppEvent::ResourceBusy(kind) => match kind {
+                ResourceKind::Network => {
+                    self.net_active = self.net_active.saturating_add(1);
+                }
+                ResourceKind::Disk => {
+                    self.disk_active = self.disk_active.saturating_add(1);
+                }
+            },
+            AppEvent::ResourceIdle(kind) => match kind {
+                ResourceKind::Network => {
+                    self.net_active = self.net_active.saturating_sub(1);
+                }
+                ResourceKind::Disk => {
+                    self.disk_active = self.disk_active.saturating_sub(1);
+                }
+            },
             AppEvent::Key(key) => {
                 if key.kind == crossterm::event::KeyEventKind::Press
                     && matches!(
@@ -99,12 +130,15 @@ impl App {
     pub(crate) async fn new() -> Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-        let initial_sessions =
-            crate::workers::blocking(crate::data::sessions::scan_active_sessions, Vec::new()).await;
+        let initial_sessions = crate::workers::blocking(
+            || crate::data::sessions::SessionCache::new().scan(),
+            Vec::new(),
+        )
+        .await;
 
         let state = State {
             sessions: initial_sessions,
-            fetching: true,
+            usage_fetching: true,
             ..State::default()
         };
 
@@ -246,16 +280,16 @@ mod tests {
     #[test]
     fn handle_usage_fetching_sets_flag() {
         let mut state = State::default();
-        assert!(!state.fetching);
+        assert!(!state.usage_fetching);
         let shutdown = state.handle(AppEvent::UsageFetching);
         assert!(!shutdown);
-        assert!(state.fetching);
+        assert!(state.usage_fetching);
     }
 
     #[test]
     fn handle_usage_updated_ok() {
         let mut state = State {
-            fetching: true,
+            usage_fetching: true,
             ..State::default()
         };
         let shutdown = state.handle(AppEvent::UsageUpdated {
@@ -263,16 +297,16 @@ mod tests {
             elapsed: Duration::from_millis(100),
         });
         assert!(!shutdown);
-        assert!(!state.fetching);
+        assert!(!state.usage_fetching);
         assert!(state.usage.is_some());
         assert!(state.error.is_none());
-        assert_eq!(state.health, Some(HealthStatus::Ok));
+        assert_eq!(state.health(), HealthStatus::Ok);
     }
 
     #[test]
     fn handle_usage_updated_error() {
         let mut state = State {
-            fetching: true,
+            usage_fetching: true,
             ..State::default()
         };
         let shutdown = state.handle(AppEvent::UsageUpdated {
@@ -280,9 +314,9 @@ mod tests {
             elapsed: Duration::from_millis(100),
         });
         assert!(!shutdown);
-        assert!(!state.fetching);
+        assert!(!state.usage_fetching);
         assert!(state.error.is_some());
-        assert_eq!(state.health, Some(HealthStatus::Error));
+        assert_eq!(state.health(), HealthStatus::Error);
     }
 
     #[test]
@@ -293,7 +327,7 @@ mod tests {
             elapsed: Duration::from_secs(5),
         });
         assert!(!shutdown);
-        assert_eq!(state.health, Some(HealthStatus::Slow));
+        assert_eq!(state.health(), HealthStatus::Slow);
     }
 
     #[test]
@@ -390,5 +424,106 @@ mod tests {
         });
         assert_eq!(state.account_email.as_deref(), Some("new@example.com"));
         assert_eq!(state.plan, Some(Plan::Max));
+    }
+
+    #[test]
+    fn handle_resource_busy_increments_counters() {
+        let mut state = State::default();
+        assert_eq!(state.net_active, 0);
+        assert_eq!(state.disk_active, 0);
+
+        state.handle(AppEvent::ResourceBusy(ResourceKind::Network));
+        assert_eq!(state.net_active, 1);
+
+        state.handle(AppEvent::ResourceBusy(ResourceKind::Disk));
+        assert_eq!(state.disk_active, 1);
+    }
+
+    #[test]
+    fn handle_resource_idle_decrements_counters() {
+        let mut state = State {
+            net_active: 2,
+            disk_active: 1,
+            ..State::default()
+        };
+
+        state.handle(AppEvent::ResourceIdle(ResourceKind::Network));
+        assert_eq!(state.net_active, 1);
+
+        state.handle(AppEvent::ResourceIdle(ResourceKind::Disk));
+        assert_eq!(state.disk_active, 0);
+    }
+
+    #[test]
+    fn handle_resource_idle_saturates_at_zero() {
+        let mut state = State::default();
+        assert_eq!(state.net_active, 0);
+
+        state.handle(AppEvent::ResourceIdle(ResourceKind::Network));
+        assert_eq!(state.net_active, 0);
+
+        state.handle(AppEvent::ResourceIdle(ResourceKind::Disk));
+        assert_eq!(state.disk_active, 0);
+    }
+
+    #[test]
+    fn handle_resource_multiple_busy() {
+        let mut state = State::default();
+
+        state.handle(AppEvent::ResourceBusy(ResourceKind::Network));
+        state.handle(AppEvent::ResourceBusy(ResourceKind::Network));
+        assert_eq!(state.net_active, 2);
+
+        state.handle(AppEvent::ResourceIdle(ResourceKind::Network));
+        assert_eq!(state.net_active, 1);
+    }
+
+    #[test]
+    fn handle_status_updated_error() {
+        let mut state = State::default();
+        let shutdown = state.handle(AppEvent::StatusUpdated(Err(FetchError::Timeout)));
+        assert!(!shutdown);
+        assert!(state.status_error.is_some());
+        assert_eq!(state.health(), HealthStatus::Error);
+    }
+
+    #[test]
+    fn handle_status_updated_ok_clears_error() {
+        let mut state = State {
+            status_error: Some(FetchError::Timeout),
+            ..State::default()
+        };
+        assert_eq!(state.health(), HealthStatus::Error);
+        state.handle(AppEvent::StatusUpdated(Ok(dummy_status())));
+        assert!(state.status_error.is_none());
+        assert_eq!(state.health(), HealthStatus::Ok);
+    }
+
+    #[test]
+    fn health_composite_worst_case() {
+        let mut state = State::default();
+        assert_eq!(state.health(), HealthStatus::Ok);
+
+        // Usage slow, no status error → Slow
+        state.handle(AppEvent::UsageUpdated {
+            data: Ok(dummy_usage()),
+            elapsed: Duration::from_secs(5),
+        });
+        assert_eq!(state.health(), HealthStatus::Slow);
+
+        // Usage slow + status error → Error (worst case wins)
+        state.handle(AppEvent::StatusUpdated(Err(FetchError::Timeout)));
+        assert_eq!(state.health(), HealthStatus::Error);
+
+        // Status recovers → back to Slow
+        state.handle(AppEvent::StatusUpdated(Ok(dummy_status())));
+        assert_eq!(state.health(), HealthStatus::Slow);
+
+        // Usage recovers → Ok
+        state.handle(AppEvent::UsageUpdated {
+            data: Ok(dummy_usage()),
+            elapsed: Duration::from_millis(100),
+        });
+        assert_eq!(state.health(), HealthStatus::Ok);
     }
 }

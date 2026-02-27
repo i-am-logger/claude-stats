@@ -1,12 +1,9 @@
+use super::{Backoff, ResourceGuard};
 use crate::credentials::{self, Plan};
 use crate::data::{profile, usage};
 use crate::error::{CredentialError, FetchError};
-use crate::event::{AppEvent, EventTx};
+use crate::event::{AppEvent, EventTx, ResourceKind};
 use std::time::{Duration, Instant};
-
-const NORMAL_INTERVAL: Duration = Duration::from_secs(30);
-const BACKOFF_INTERVAL: Duration = Duration::from_secs(60);
-const BACKOFF_THRESHOLD: u32 = 3;
 
 /// Tracked account state for change detection.
 #[derive(Default, PartialEq, Eq)]
@@ -17,7 +14,7 @@ struct AccountState {
 
 pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut consecutive_cred_errors: u32 = 0;
+        let mut backoff = Backoff::new(Duration::from_secs(30), Duration::from_secs(60), 3);
         let mut cached_token: Option<String> = None;
         let mut prev_account = AccountState::default();
 
@@ -26,48 +23,60 @@ pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHa
                 break;
             }
 
-            let creds_result = super::blocking(
-                credentials::get_credentials,
-                Err(CredentialError::FileNotFound),
-            )
-            .await;
+            let creds_result = {
+                let _guard = ResourceGuard::acquire(&tx, ResourceKind::Disk);
+                super::blocking(
+                    credentials::get_credentials,
+                    Err(CredentialError::FileNotFound),
+                )
+                .await
+            };
 
             match creds_result {
                 Ok(creds) => {
-                    consecutive_cred_errors = 0;
+                    tracing::debug!("credentials loaded");
+                    let (result, elapsed) = {
+                        let _guard = ResourceGuard::acquire(&tx, ResourceKind::Network);
 
-                    // Re-fetch profile email when the token changes (login/logout)
-                    let token_changed = cached_token.as_ref() != Some(&creds.token);
-                    let email = if token_changed {
-                        cached_token = Some(creds.token.clone());
-                        profile::fetch_profile_email(&client, &creds.token)
-                            .await
-                            .ok()
-                    } else {
-                        prev_account.email.clone()
-                    };
+                        // Re-fetch profile email when the token changes (login/logout)
+                        let token_changed = cached_token.as_ref() != Some(&creds.token);
+                        let email = if token_changed {
+                            cached_token = Some(creds.token.clone());
+                            profile::fetch_profile_email(&client, &creds.token)
+                                .await
+                                .ok()
+                        } else {
+                            prev_account.email.clone()
+                        };
 
-                    let current = AccountState {
-                        email,
-                        plan: creds.plan,
-                    };
-                    if current != prev_account {
-                        if tx
-                            .send(AppEvent::AccountUpdated {
-                                email: current.email.clone(),
-                                plan: current.plan.clone(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        let current = AccountState {
+                            email,
+                            plan: creds.plan,
+                        };
+                        if current != prev_account {
+                            if tx
+                                .send(AppEvent::AccountUpdated {
+                                    email: current.email.clone(),
+                                    plan: current.plan.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            prev_account = current;
                         }
-                        prev_account = current;
-                    }
 
-                    let start = Instant::now();
-                    let result = usage::fetch_usage(&client, &creds.token).await;
-                    let elapsed = start.elapsed();
+                        let start = Instant::now();
+                        let result = usage::fetch_usage(&client, &creds.token).await;
+                        (result, start.elapsed())
+                    };
+
+                    if let Err(ref e) = result {
+                        tracing::warn!("usage fetch error: {e}");
+                    }
+                    backoff.record(result.is_err());
+
                     if tx
                         .send(AppEvent::UsageUpdated {
                             data: result,
@@ -80,7 +89,8 @@ pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHa
                     }
                 }
                 Err(e) => {
-                    consecutive_cred_errors = consecutive_cred_errors.saturating_add(1);
+                    tracing::warn!("credential error: {e}");
+                    backoff.record(true);
                     cached_token = None;
 
                     let logged_out = AccountState::default();
@@ -111,12 +121,7 @@ pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHa
                 }
             }
 
-            let sleep_dur = if consecutive_cred_errors >= BACKOFF_THRESHOLD {
-                BACKOFF_INTERVAL
-            } else {
-                NORMAL_INTERVAL
-            };
-            tokio::time::sleep(sleep_dur).await;
+            tokio::time::sleep(backoff.interval()).await;
         }
     })
 }

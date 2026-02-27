@@ -1,4 +1,5 @@
 use crate::data::incidents::{IncidentImpact, StatusData, StatusIndicator};
+use crate::fmt::truncate_str;
 use crate::ui::common::{indented, padded, Section, DIM};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -21,11 +22,29 @@ fn indicator_color(indicator: StatusIndicator) -> Color {
     }
 }
 
-impl StatusSection<'_> {
-    fn constraints(&self) -> Option<Vec<Constraint>> {
-        let sd = self.status.as_ref()?;
-        let mut constraints = Vec::new();
-        constraints.push(Constraint::Length(1)); // header
+impl Section for StatusSection<'_> {
+    fn height(&self, _width: u16) -> u16 {
+        let Some(sd) = self.status.as_ref() else {
+            return 0;
+        };
+        let mut h: u16 = 2; // header + spacer
+        if !sd.incidents.is_empty() {
+            h += 1; // blank
+            for incident in &sd.incidents {
+                h += 1; // title
+                if incident.latest_body().is_some() {
+                    h += 1; // body
+                }
+                h += 1; // timing
+            }
+        }
+        h
+    }
+
+    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(sd) = self.status else { return };
+
+        let mut constraints = vec![Constraint::Length(1)]; // header
         if !sd.incidents.is_empty() {
             constraints.push(Constraint::Length(1)); // blank
             for incident in &sd.incidents {
@@ -37,20 +56,6 @@ impl StatusSection<'_> {
             }
         }
         constraints.push(Constraint::Length(1)); // spacer
-        Some(constraints)
-    }
-}
-
-impl Section for StatusSection<'_> {
-    fn height(&self, _width: u16) -> u16 {
-        self.constraints().map_or(0, |c| c.len() as u16)
-    }
-
-    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        let Some(sd) = self.status else { return };
-        let Some(constraints) = self.constraints() else {
-            return;
-        };
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -61,9 +66,9 @@ impl Section for StatusSection<'_> {
 
         let color = indicator_color(sd.summary.indicator);
         let icon = if sd.summary.indicator == StatusIndicator::None {
-            "●"
+            "\u{f012f}" // nf-md-checkbox_blank_circle
         } else {
-            "⚠"
+            "\u{f0028}" // nf-md-alert_circle
         };
         let status_header = Paragraph::new(Line::from(vec![
             Span::styled(format!("{icon} "), Style::default().fg(color)),
@@ -105,14 +110,8 @@ impl Section for StatusSection<'_> {
                 if let Some(body) = incident.latest_body() {
                     let Some(area) = chunks.get(i) else { return };
                     let body_area = indented(*area);
-                    let max_len = body_area.width as usize;
                     let clean = body.replace('\n', " ");
-                    let truncated = if clean.chars().count() > max_len {
-                        let t: String = clean.chars().take(max_len.saturating_sub(1)).collect();
-                        format!("{t}…")
-                    } else {
-                        clean
-                    };
+                    let truncated = truncate_str(&clean, body_area.width as usize);
                     let body_row = Paragraph::new(Line::from(Span::styled(
                         truncated,
                         Style::default().fg(DIM),
