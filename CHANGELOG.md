@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0](https://github.com/i-am-logger/claude-stats/compare/v1.2.0...v1.3.0) (2026-02-27)
+
+
+### Features
+
+* add criterion benchmarks, proptest, cargo-deny, MSRV CI ([c099376](https://github.com/i-am-logger/claude-stats/commit/c099376ceeeac185eb00caf4e9f44f0098a357bb))
+
+
+### Bug Fixes
+
+* bump MSRV to 1.88 to match dependency requirements ([58dcd8a](https://github.com/i-am-logger/claude-stats/commit/58dcd8a4b0a1073450373256890497bee33bb09f))
+
 ## [1.2.0](https://github.com/i-am-logger/claude-stats/compare/v1.1.0...v1.2.0) (2026-02-27)
 
 
