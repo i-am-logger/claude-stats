@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2](https://github.com/i-am-logger/claude-stats/compare/v1.4.1...v1.4.2) (2026-02-27)
+
+
+### Bug Fixes
+
+* improve session parsing accuracy and subagent task detection ([964eac3](https://github.com/i-am-logger/claude-stats/commit/964eac34f32d4b087fc08935a9104a51754ea572))
+
 ## [1.4.1](https://github.com/i-am-logger/claude-stats/compare/v1.4.0...v1.4.1) (2026-02-27)
 
 
