@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/i-am-logger/claude-stats/compare/v1.1.0...v1.2.0) (2026-02-27)
+
+
+### Features
+
+* resource tracking, session caching, logging, and robustness ([ba8182b](https://github.com/i-am-logger/claude-stats/commit/ba8182b833254cfc3d946626b75b2506cc0a70bd))
+
 ## [1.1.0](https://github.com/i-am-logger/claude-stats/compare/v1.0.0...v1.1.0) (2026-02-26)
 
 
