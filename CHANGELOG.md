@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/i-am-logger/claude-stats/compare/v1.3.0...v1.4.0) (2026-02-27)
+
+
+### Features
+
+* show update notification when newer claude-stats release is available ([3502bde](https://github.com/i-am-logger/claude-stats/commit/3502bde47062dc7a4c30903c8be8b24b181e3323))
+
 ## [1.3.0](https://github.com/i-am-logger/claude-stats/compare/v1.2.0...v1.3.0) (2026-02-27)
 
 
