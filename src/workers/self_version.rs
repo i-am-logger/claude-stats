@@ -10,8 +10,8 @@ pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHa
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         let mut backoff = Backoff::new(
-            Duration::from_secs(3600), // 1 hour
-            Duration::from_secs(7200), // 2 hours
+            Duration::from_secs(600),  // 10 minutes
+            Duration::from_secs(1200), // 20 minutes
             3,
         );
         let mut prev: Option<SelfVersion> = None;
