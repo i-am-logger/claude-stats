@@ -21,6 +21,10 @@ in
     pkgs.pkg-config
     pkgs.nixpkgs-fmt
     pkgs.cargo-watch
+    pkgs.cargo-llvm-cov
+    pkgs.cargo-deny
+    pkgs.cargo-bloat
+    pkgs.cargo-mutants
   ];
 
   # Development scripts
@@ -41,6 +45,28 @@ in
 
   scripts.dev-watch.exec = ''
     cargo watch -x run
+  '';
+
+  scripts.dev-coverage.exec = ''
+    echo "Running tests with coverage..."
+    cargo llvm-cov --html
+    echo "Coverage report: target/llvm-cov/html/index.html"
+  '';
+
+  scripts.dev-bench.exec = ''
+    echo "Running benchmarks..."
+    cargo bench --bench parsing
+    echo "Report: target/criterion/report/index.html"
+  '';
+
+  scripts.dev-bloat.exec = ''
+    echo "Analyzing binary size..."
+    cargo bloat --release --crates
+  '';
+
+  scripts.dev-mutants.exec = ''
+    echo "Running mutation tests..."
+    cargo mutants
   '';
 
   # Environment variables
@@ -66,6 +92,10 @@ in
     echo "    • dev-run       - Run the application"
     echo "    • dev-build     - Build the application"
     echo "    • dev-watch     - Watch and auto-reload"
+    echo "    • dev-coverage  - Run tests with coverage report"
+    echo "    • dev-bench     - Run criterion benchmarks"
+    echo "    • dev-bloat     - Analyze binary size by crate"
+    echo "    • dev-mutants   - Run mutation tests"
     echo ""
   '';
 
@@ -80,6 +110,7 @@ in
       "clippy"
       "rustfmt"
       "rust-analyzer"
+      "llvm-tools-preview"
     ];
   };
 

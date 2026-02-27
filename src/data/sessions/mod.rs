@@ -1,13 +1,18 @@
-mod activity;
-mod subagents;
-mod tail;
+#![allow(
+    unreachable_pub,
+    reason = "pub items exposed via lib.rs for benchmarks"
+)]
+
+pub mod activity;
+pub mod subagents;
+pub mod tail;
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-pub(crate) use tail::CONTEXT_WINDOW;
+pub use tail::CONTEXT_WINDOW;
 
 /// Sessions modified more than 60s ago are considered inactive and excluded
 /// from the dashboard.
@@ -15,10 +20,10 @@ const MAX_AGE_SECS: u64 = 60;
 
 /// How many bytes from the end of a session file to read when extracting
 /// recent lines (64 KB). Shared by `read_last_lines` and subagent scanning.
-const RECENT_TAIL_BYTES: u64 = 64_000;
+pub(crate) const RECENT_TAIL_BYTES: u64 = 64_000;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionState {
+pub enum SessionState {
     #[default]
     Idle,
     Thinking,
@@ -26,7 +31,7 @@ pub(crate) enum SessionState {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelShort {
+pub enum ModelShort {
     Opus,
     Sonnet,
     Haiku,
@@ -46,28 +51,29 @@ impl std::fmt::Display for ModelShort {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SubagentData {
-    pub(crate) task: String,
-    pub(crate) model: ModelShort,
-    pub(crate) context_tokens: u64,
-    pub(crate) state: SessionState,
+pub struct SubagentData {
+    pub task: String,
+    pub model: ModelShort,
+    pub context_tokens: u64,
+    pub state: SessionState,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SessionData {
-    pub(crate) title: String,
-    pub(crate) git_branch: String,
-    pub(crate) context_tokens: u64,
-    pub(crate) context_percent: u16,
-    pub(crate) agents: Vec<SubagentData>,
-    pub(crate) compactions: u32,
-    pub(crate) last_activity_label: String,
-    pub(crate) state: SessionState,
-    pub(crate) activity: String,
+pub struct SessionData {
+    pub title: String,
+    pub git_branch: String,
+    pub context_tokens: u64,
+    pub context_percent: u16,
+    pub agents: Vec<SubagentData>,
+    pub compactions: u32,
+    pub last_activity_label: String,
+    pub state: SessionState,
+    pub activity: String,
 }
 
 /// Cached computed state for a session file. Stores only the derived values,
 /// not the file content.
+#[derive(Debug)]
 struct CachedEntry {
     cwd: String,
     git_branch: String,
@@ -78,12 +84,13 @@ struct CachedEntry {
 
 /// Caches session file state across polls. First encounter does a full read;
 /// subsequent polls read only the new bytes appended since last scan.
-pub(crate) struct SessionCache {
+#[derive(Debug, Default)]
+pub struct SessionCache {
     entries: HashMap<PathBuf, CachedEntry>,
 }
 
 impl SessionCache {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
         }
@@ -91,7 +98,7 @@ impl SessionCache {
 
     /// Scan all active session files and return session data. Uses cached state
     /// for files seen before, full reads for new files.
-    pub(crate) fn scan(&mut self) -> Vec<SessionData> {
+    pub fn scan(&mut self) -> Vec<SessionData> {
         let claude_dir = match dirs::home_dir() {
             Some(h) => h.join(".claude").join("projects"),
             None => return Vec::new(),

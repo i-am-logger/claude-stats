@@ -238,6 +238,37 @@ mod tests {
         let s: StatusIndicator = serde_json::from_str(r#""major""#).unwrap();
         assert_eq!(s, StatusIndicator::Major);
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_unknown_status_deserializes(s in "[a-z_]{1,30}") {
+                let json = format!(r#""{s}""#);
+                let status: Result<IncidentStatus, _> = serde_json::from_str(&json);
+                // Known variants match; everything else is Unknown
+                prop_assert!(status.is_ok());
+            }
+
+            #[test]
+            fn prop_unknown_impact_deserializes(s in "[a-z_]{1,30}") {
+                let json = format!(r#""{s}""#);
+                let impact: Result<IncidentImpact, _> = serde_json::from_str(&json);
+                prop_assert!(impact.is_ok());
+            }
+
+            #[test]
+            fn prop_unknown_indicator_deserializes(s in "[a-z_]{1,30}") {
+                let json = format!(r#""{s}""#);
+                let indicator: Result<StatusIndicator, _> = serde_json::from_str(&json);
+                prop_assert!(indicator.is_ok());
+            }
+        }
+    }
 }
 
 pub(crate) async fn fetch_status(

@@ -1,3 +1,8 @@
+#![allow(
+    unreachable_pub,
+    reason = "pub items exposed via lib.rs for benchmarks"
+)]
+
 use super::tail::{parse_json_line, read_last_lines};
 use super::SessionState;
 use crate::fmt::truncate_str;
@@ -76,7 +81,7 @@ fn state_from_assistant(val: &Value) -> SessionState {
     }
 }
 
-pub(super) fn detect_state_and_activity(lines: &[String]) -> (SessionState, String) {
+pub fn detect_state_and_activity(lines: &[String]) -> (SessionState, String) {
     if lines.is_empty() {
         return (SessionState::Idle, String::new());
     }
@@ -107,7 +112,7 @@ pub(super) fn detect_state_and_activity(lines: &[String]) -> (SessionState, Stri
 
 /// Lightweight state detection for subagent files — reads last 3 lines and
 /// returns just the state without computing an activity string.
-pub(super) fn detect_state_from_tail(file: &fs::File, file_len: u64) -> SessionState {
+pub fn detect_state_from_tail(file: &fs::File, file_len: u64) -> SessionState {
     let lines = read_last_lines(file, file_len, 3);
     if lines.is_empty() {
         return SessionState::Idle;
@@ -656,5 +661,47 @@ mod tests {
             "message": {"content": [{"type": "text", "text": "hi"}]}
         });
         assert_eq!(extract_tool_names(&val), "working");
+    }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_type() -> impl Strategy<Value = &'static str> {
+            prop_oneof![
+                Just("progress"),
+                Just("assistant"),
+                Just("system"),
+                Just("user"),
+                Just("tag"),
+                Just("unknown"),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn prop_classify_line_never_panics(type_str in arb_type()) {
+                let val = json!({"type": type_str});
+                let _ = classify_line(&val);
+            }
+
+            #[test]
+            fn prop_detect_state_and_activity_valid_state(
+                line_count in 0..=10_usize,
+                type_str in arb_type(),
+            ) {
+                let lines: Vec<String> = (0..line_count)
+                    .map(|_| format!(r#"{{"type":"{}"}}"#, type_str))
+                    .collect();
+                let (state, _activity) = detect_state_and_activity(&lines);
+                // State must be a valid variant
+                assert!(matches!(
+                    state,
+                    SessionState::Idle | SessionState::Thinking | SessionState::Working
+                ));
+            }
+        }
     }
 }

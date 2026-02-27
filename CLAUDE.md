@@ -14,9 +14,13 @@ cargo test                   # Run all tests
 cargo test <test_name>       # Run a single test
 cargo fmt --check            # Check formatting
 cargo clippy -- -D warnings  # Lint
+cargo bench --bench parsing  # Run criterion benchmarks
+cargo deny check             # License/advisory audit
+cargo bloat --release --crates  # Binary size breakdown
+cargo mutants                # Mutation testing
 ```
 
-With devenv: `dev-run`, `dev-build`, `dev-test`, `dev-watch`
+With devenv: `dev-run`, `dev-build`, `dev-test`, `dev-watch`, `dev-coverage`, `dev-bench`, `dev-bloat`, `dev-mutants`
 
 ## Architecture
 
@@ -48,3 +52,5 @@ Strict lint configuration in `Cargo.toml` — all clippy warnings are errors:
 - Workers recover from errors with exponential backoff (3+ consecutive errors → 30s)
 - Visibility: prefer `pub(crate)` for internal APIs
 - Tests go in `#[cfg(test)] mod tests` at the bottom of each file
+- Property tests use proptest in a nested `mod prop` inside `mod tests`, with functions prefixed `prop_`
+- `src/lib.rs` re-exports modules for benchmark access; benchmark-target functions use `pub` visibility with `#![allow(unreachable_pub)]`

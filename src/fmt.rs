@@ -1,16 +1,21 @@
+#![allow(
+    unreachable_pub,
+    reason = "pub items exposed via lib.rs for benchmarks"
+)]
+
 use std::time::Duration;
 
 /// Format a duration in seconds as a human-readable string.
 ///
 /// Thin wrapper around [`humantime::format_duration`] that accepts
 /// signed seconds (negative values are clamped to zero).
-pub(crate) fn format_duration(secs: i64) -> String {
+pub fn format_duration(secs: i64) -> String {
     let dur = Duration::from_secs(secs.max(0) as u64);
     humantime::format_duration(dur).to_string()
 }
 
 /// Truncate a string to at most `max` characters, appending `…` if truncated.
-pub(crate) fn truncate_str(s: &str, max: usize) -> String {
+pub fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else if max < 2 {
@@ -86,5 +91,35 @@ mod tests {
             truncate_str("\u{1f389}\u{1f38a}\u{1f388}\u{1f386}\u{1f387}", 4),
             "\u{1f389}\u{1f38a}\u{1f388}\u{2026}"
         );
+    }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_truncate_str_length_invariant(s in "\\PC{0,200}", max in 0..=200_usize) {
+                let result = truncate_str(&s, max);
+                let result_chars = result.chars().count();
+                prop_assert!(
+                    result_chars <= max,
+                    "truncate_str({:?}, {}) produced {} chars",
+                    s, max, result_chars
+                );
+            }
+
+            #[test]
+            fn prop_format_duration_never_panics(secs in i64::MIN..=i64::MAX) {
+                drop(format_duration(secs));
+            }
+
+            #[test]
+            fn prop_format_duration_negative_equals_zero(secs in i64::MIN..=-1_i64) {
+                assert_eq!(format_duration(secs), format_duration(0));
+            }
+        }
     }
 }

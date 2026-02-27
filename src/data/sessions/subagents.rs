@@ -1,3 +1,8 @@
+#![allow(
+    unreachable_pub,
+    reason = "pub items exposed via lib.rs for benchmarks"
+)]
+
 use super::activity::detect_state_from_tail;
 use super::tail::{extract_tokens, is_assistant_usage, parse_json_line, seek_tail};
 use super::{ModelShort, SubagentData};
@@ -11,7 +16,7 @@ use std::time::{Duration, SystemTime};
 /// active subagent list (half of `MAX_AGE_SECS` for the parent session).
 const SUBAGENT_MAX_AGE_SECS: u64 = 30;
 
-pub(super) fn scan_subagents(subagents_dir: &Path) -> Vec<SubagentData> {
+pub fn scan_subagents(subagents_dir: &Path) -> Vec<SubagentData> {
     let now = SystemTime::now();
     let Ok(entries) = fs::read_dir(subagents_dir) else {
         return Vec::new();
@@ -161,5 +166,34 @@ mod tests {
     #[test]
     fn parse_model_no_dash() {
         assert_eq!(parse_model("custom"), ModelShort::Unknown);
+    }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_parse_model_never_panics(s in "\\PC*") {
+                let _model = parse_model(&s);
+            }
+
+            #[test]
+            fn prop_parse_model_contains_match(
+                prefix in "[a-z\\-]{0,20}",
+                suffix in "[a-z0-9\\-]{0,20}",
+            ) {
+                let model_opus = format!("{prefix}opus{suffix}");
+                assert_eq!(parse_model(&model_opus), ModelShort::Opus);
+
+                let model_sonnet = format!("{prefix}sonnet{suffix}");
+                assert_eq!(parse_model(&model_sonnet), ModelShort::Sonnet);
+
+                let model_haiku = format!("{prefix}haiku{suffix}");
+                assert_eq!(parse_model(&model_haiku), ModelShort::Haiku);
+            }
+        }
     }
 }

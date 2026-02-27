@@ -1,8 +1,13 @@
-pub(crate) mod claude_version;
-pub(crate) mod incidents;
-pub(crate) mod profile;
-pub(crate) mod sessions;
-pub(crate) mod usage;
+#![allow(
+    unreachable_pub,
+    reason = "pub items exposed via lib.rs for benchmarks"
+)]
+
+pub mod claude_version;
+pub mod incidents;
+pub mod profile;
+pub mod sessions;
+pub mod usage;
 
 pub(super) const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
 

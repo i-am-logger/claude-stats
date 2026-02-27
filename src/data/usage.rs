@@ -126,4 +126,31 @@ mod tests {
             "now"
         );
     }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_percent_always_0_to_100(u in -1000.0_f64..=1000.0_f64) {
+                let l = UsageLimit { utilization: Some(u), resets_at: None };
+                let p = l.percent();
+                assert!(p <= 100, "percent was {p} for utilization {u}");
+            }
+
+            #[test]
+            fn prop_remaining_secs_non_negative(offset in -100_000_i64..=100_000_i64) {
+                let dt = Utc::now() + chrono::TimeDelta::seconds(offset);
+                let l = UsageLimit {
+                    utilization: None,
+                    resets_at: Some(dt),
+                };
+                let secs = l.remaining_secs().unwrap();
+                assert!(secs >= 0, "remaining_secs was {secs}");
+            }
+        }
+    }
 }

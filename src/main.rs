@@ -7,6 +7,11 @@ mod fmt;
 mod ui;
 mod workers;
 
+use claude_stats as _;
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use proptest as _;
 #[cfg(test)]
 use tempfile as _;
 

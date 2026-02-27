@@ -1,9 +1,14 @@
+#![allow(
+    unreachable_pub,
+    reason = "pub items exposed via lib.rs for benchmarks"
+)]
+
 use crate::error::CredentialError;
 use std::fmt;
 use std::fs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Plan {
+pub enum Plan {
     Max,
     Pro,
     Team,
@@ -12,7 +17,7 @@ pub(crate) enum Plan {
 }
 
 impl Plan {
-    pub(crate) fn from_api(s: &str) -> Self {
+    pub fn from_api(s: &str) -> Self {
         match s {
             "max" => Self::Max,
             "pro" => Self::Pro,
@@ -89,5 +94,19 @@ mod tests {
     #[test]
     fn from_api_unknown() {
         assert_eq!(Plan::from_api("free"), Plan::Other("free".to_string()));
+    }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_from_api_never_panics(s in "\\PC{0,100}") {
+                let _plan = Plan::from_api(&s);
+            }
+        }
     }
 }

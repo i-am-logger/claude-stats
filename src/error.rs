@@ -1,7 +1,12 @@
+#![allow(
+    unreachable_pub,
+    reason = "pub items exposed via lib.rs for benchmarks"
+)]
+
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
-pub(crate) enum FetchError {
+pub enum FetchError {
     #[error("API error ({status}): {body}")]
     Api { status: u16, body: String },
 
@@ -32,9 +37,7 @@ impl From<reqwest::Error> for FetchError {
 
 /// Check an HTTP response status and return the response on success, or a
 /// `FetchError::Api` with the status code and body text on failure.
-pub(crate) async fn check_response(
-    resp: reqwest::Response,
-) -> Result<reqwest::Response, FetchError> {
+pub async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response, FetchError> {
     if resp.status().is_success() {
         return Ok(resp);
     }
@@ -47,7 +50,7 @@ pub(crate) async fn check_response(
 }
 
 #[derive(Debug, Clone, Error)]
-pub(crate) enum CredentialError {
+pub enum CredentialError {
     #[error("home directory not found")]
     NoHomeDir,
 

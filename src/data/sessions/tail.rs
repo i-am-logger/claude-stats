@@ -1,27 +1,33 @@
+#![allow(
+    unreachable_pub,
+    reason = "pub items exposed via lib.rs for benchmarks"
+)]
+
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
 /// Claude's context window size in tokens. Used to compute context utilisation
 /// percentage. Must be non-zero to avoid division-by-zero in `parse_session`.
-pub(crate) const CONTEXT_WINDOW: u64 = 166_000;
+pub const CONTEXT_WINDOW: u64 = 166_000;
 const _: () = assert!(CONTEXT_WINDOW > 0);
 
 /// Number of recent lines to retain for state detection.
 const RECENT_LINES: usize = 5;
 
 /// Result of scanning an entire session file in a single pass.
-pub(super) struct SessionFileData {
-    pub(super) cwd: String,
-    pub(super) git_branch: String,
-    pub(super) last_tokens: u64,
-    pub(super) compactions: u32,
-    pub(super) last_lines: Vec<String>,
+#[derive(Debug)]
+pub struct SessionFileData {
+    pub cwd: String,
+    pub git_branch: String,
+    pub last_tokens: u64,
+    pub compactions: u32,
+    pub last_lines: Vec<String>,
 }
 
 /// Seek to `seek_pos` in the file, discard the partial first line if not at
 /// the start, and return a `BufReader` positioned at the first complete line.
-pub(super) fn seek_tail(file: &fs::File, seek_pos: u64) -> Option<BufReader<&fs::File>> {
+pub fn seek_tail(file: &fs::File, seek_pos: u64) -> Option<BufReader<&fs::File>> {
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(seek_pos)).ok()?;
     if seek_pos > 0 {
@@ -33,7 +39,7 @@ pub(super) fn seek_tail(file: &fs::File, seek_pos: u64) -> Option<BufReader<&fs:
 
 /// Try to parse a line as JSON. Returns `None` on failure, logging non-empty
 /// lines that fail to parse.
-pub(super) fn parse_json_line(line: &str) -> Option<serde_json::Value> {
+pub fn parse_json_line(line: &str) -> Option<serde_json::Value> {
     match serde_json::from_str(line) {
         Ok(val) => Some(val),
         Err(e) => {
@@ -45,10 +51,12 @@ pub(super) fn parse_json_line(line: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// Read the entire session file in one pass. Extracts metadata (cwd, branch)
-/// from the first user line, and scans every line for token usage, compaction
-/// markers, and the last few lines for state detection.
-pub(super) fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
+/// Read the entire session file in one pass.
+///
+/// Extracts metadata (cwd, branch) from the first user line, and scans every
+/// line for token usage, compaction markers, and the last few lines for state
+/// detection.
+pub fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
     let mut file = file;
     file.seek(SeekFrom::Start(0)).ok()?;
     let reader = BufReader::new(&mut file);
@@ -107,16 +115,17 @@ pub(super) fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
 }
 
 /// Result of an incremental scan (from a byte offset to EOF).
-pub(super) struct ScanResult {
-    pub(super) last_tokens: u64,
-    pub(super) compactions: u32,
-    pub(super) last_lines: Vec<String>,
+#[derive(Debug)]
+pub struct ScanResult {
+    pub last_tokens: u64,
+    pub compactions: u32,
+    pub last_lines: Vec<String>,
 }
 
 /// Scan a session file from `offset` to EOF. Tracks token usage, compaction
 /// markers, and the last few non-empty lines. Used for incremental reads after
 /// the initial full scan.
-pub(super) fn scan_from_offset(file: &fs::File, offset: u64) -> ScanResult {
+pub fn scan_from_offset(file: &fs::File, offset: u64) -> ScanResult {
     let mut file = file;
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return ScanResult {
@@ -173,12 +182,12 @@ fn is_compact_boundary(val: &serde_json::Value) -> bool {
 
 /// Returns `true` when the JSON value is an assistant message with a `usage`
 /// object (i.e. not a progress event).
-pub(super) fn is_assistant_usage(val: &serde_json::Value) -> bool {
+pub fn is_assistant_usage(val: &serde_json::Value) -> bool {
     val.get("type").and_then(|t| t.as_str()) == Some("assistant")
         && val.pointer("/message/usage").is_some()
 }
 
-pub(super) fn extract_tokens(usage: &serde_json::Value) -> u64 {
+pub fn extract_tokens(usage: &serde_json::Value) -> u64 {
     let input = usage
         .get("input_tokens")
         .and_then(serde_json::Value::as_u64)
@@ -196,7 +205,7 @@ pub(super) fn extract_tokens(usage: &serde_json::Value) -> u64 {
         .saturating_add(cache_read)
 }
 
-pub(super) fn read_last_lines(file: &fs::File, file_len: u64, count: usize) -> Vec<String> {
+pub fn read_last_lines(file: &fs::File, file_len: u64, count: usize) -> Vec<String> {
     if file_len == 0 {
         return Vec::new();
     }
@@ -351,5 +360,54 @@ mod tests {
             "cache_creation_input_tokens": 1_u64,
         });
         assert_eq!(extract_tokens(&usage), u64::MAX);
+    }
+
+    // ── property tests ────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_parse_json_line_never_panics(s in "\\PC*") {
+                drop(parse_json_line(&s));
+            }
+
+            #[test]
+            fn prop_extract_tokens_never_panics(
+                input in proptest::option::of(0..=u64::MAX),
+                cache_create in proptest::option::of(0..=u64::MAX),
+                cache_read in proptest::option::of(0..=u64::MAX),
+            ) {
+                let mut map = serde_json::Map::new();
+                if let Some(v) = input {
+                    map.insert("input_tokens".into(), v.into());
+                }
+                if let Some(v) = cache_create {
+                    map.insert("cache_creation_input_tokens".into(), v.into());
+                }
+                if let Some(v) = cache_read {
+                    map.insert("cache_read_input_tokens".into(), v.into());
+                }
+                let usage = serde_json::Value::Object(map);
+                let _total = extract_tokens(&usage);
+            }
+
+            #[test]
+            fn prop_extract_tokens_sum_correct(
+                input in 0..=1_000_000_u64,
+                cache_create in 0..=1_000_000_u64,
+                cache_read in 0..=1_000_000_u64,
+            ) {
+                let usage = serde_json::json!({
+                    "input_tokens": input,
+                    "cache_creation_input_tokens": cache_create,
+                    "cache_read_input_tokens": cache_read,
+                });
+                let result = extract_tokens(&usage);
+                assert_eq!(result, input + cache_create + cache_read);
+            }
+        }
     }
 }
