@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/i-am-logger/claude-stats/compare/v1.4.0...v1.4.1) (2026-02-27)
+
+
+### Bug Fixes
+
+* check for self-version updates every 10 minutes instead of hourly ([d3ac844](https://github.com/i-am-logger/claude-stats/commit/d3ac844497726804e41f14b327d62e4ca169f221))
+
 ## [1.4.0](https://github.com/i-am-logger/claude-stats/compare/v1.3.0...v1.4.0) (2026-02-27)
 
 
