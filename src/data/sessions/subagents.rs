@@ -182,8 +182,9 @@ mod tests {
 
             #[test]
             fn prop_parse_model_contains_match(
-                prefix in "[a-z\\-]{0,20}",
-                suffix in "[a-z0-9\\-]{0,20}",
+                // Use digits + dashes to avoid accidentally embedding another model name
+                prefix in "[0-9\\-]{0,10}",
+                suffix in "[0-9\\-]{0,10}",
             ) {
                 let model_opus = format!("{prefix}opus{suffix}");
                 assert_eq!(parse_model(&model_opus), ModelShort::Opus);

@@ -1,4 +1,5 @@
 use crate::data::claude_version::ClaudeVersion;
+use crate::data::self_version::{self, SelfVersion};
 use crate::ui::common::{padded, Section, DIM};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -8,12 +9,11 @@ use ratatui::{
     Frame,
 };
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 pub(super) struct HeaderSection<'a> {
     pub(super) plan: &'a Option<crate::credentials::Plan>,
     pub(super) account_email: &'a Option<String>,
     pub(super) claude_version: &'a Option<ClaudeVersion>,
+    pub(super) self_version: &'a Option<SelfVersion>,
 }
 
 impl HeaderSection<'_> {
@@ -48,14 +48,28 @@ impl Section for HeaderSection<'_> {
 
         let mut row = 1; // skip top spacer
 
-        // Title: Claude Stats v{version}
-        let title = Line::from(vec![
+        // Title: Claude Stats v{version} (X.Y.Z available)
+        let mut title_spans = vec![
             Span::styled(
                 "Claude Stats",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" v{VERSION}"), Style::default().fg(DIM)),
-        ]);
+            Span::styled(
+                format!(" v{}", self_version::CURRENT_VERSION),
+                Style::default().fg(DIM),
+            ),
+        ];
+        if let Some(sv) = self.self_version {
+            if sv.is_outdated() {
+                if let Some(latest) = &sv.latest {
+                    title_spans.push(Span::styled(
+                        format!(" ({latest} available)"),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+            }
+        }
+        let title = Line::from(title_spans);
         if let Some(&area) = chunks.get(row) {
             frame.render_widget(Paragraph::new(title), padded(area));
         }

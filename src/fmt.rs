@@ -14,6 +14,19 @@ pub fn format_duration(secs: i64) -> String {
     humantime::format_duration(dur).to_string()
 }
 
+/// Compare two dotted version strings (e.g. "1.2.3" vs "1.3.0").
+/// Returns `Ordering::Less` if `a < b`, etc.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    let va = parse(a);
+    let vb = parse(b);
+    va.cmp(&vb)
+}
+
 /// Truncate a string to at most `max` characters, appending `…` if truncated.
 pub fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -53,6 +66,29 @@ mod tests {
     #[test]
     fn hours_minutes_seconds() {
         assert_eq!(format_duration(3661), "1h 1m 1s");
+    }
+
+    #[test]
+    fn compare_major_minor_patch() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.2.3", "1.2.3"), Ordering::Equal);
+        assert_eq!(compare_versions("1.2.3", "1.2.4"), Ordering::Less);
+        assert_eq!(compare_versions("1.3.0", "1.2.9"), Ordering::Greater);
+        assert_eq!(compare_versions("2.0.0", "1.99.99"), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_different_lengths() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.0.0.0", "1.0.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn compare_non_numeric_segments() {
+        use std::cmp::Ordering;
+        // Non-numeric segments parse as 0
+        assert_eq!(compare_versions("1.beta.3", "1.0.3"), Ordering::Equal);
     }
 
     #[test]
@@ -109,6 +145,16 @@ mod tests {
                     "truncate_str({:?}, {}) produced {} chars",
                     s, max, result_chars
                 );
+            }
+
+            #[test]
+            fn prop_compare_versions_never_panics(a in "\\PC{0,30}", b in "\\PC{0,30}") {
+                let _ = compare_versions(&a, &b);
+            }
+
+            #[test]
+            fn prop_compare_versions_reflexive(a in "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}") {
+                assert_eq!(compare_versions(&a, &a), std::cmp::Ordering::Equal);
             }
 
             #[test]

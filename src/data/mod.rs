@@ -6,6 +6,7 @@
 pub mod claude_version;
 pub mod incidents;
 pub mod profile;
+pub mod self_version;
 pub mod sessions;
 pub mod usage;
 

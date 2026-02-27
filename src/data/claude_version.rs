@@ -10,24 +10,11 @@ impl ClaudeVersion {
     pub(crate) fn is_outdated(&self) -> bool {
         match (&self.installed, &self.latest) {
             (Some(installed), Some(latest)) if installed != latest => {
-                compare_versions(installed, latest) == std::cmp::Ordering::Less
+                crate::fmt::compare_versions(installed, latest) == std::cmp::Ordering::Less
             }
             _ => false,
         }
     }
-}
-
-/// Compare two dotted version strings (e.g. "1.2.3" vs "1.3.0").
-/// Returns `Ordering::Less` if `a < b`, etc.
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.')
-            .map(|p| p.parse::<u64>().unwrap_or(0))
-            .collect()
-    };
-    let va = parse(a);
-    let vb = parse(b);
-    va.cmp(&vb)
 }
 
 pub(crate) fn get_installed_version() -> Option<String> {
@@ -138,22 +125,5 @@ mod tests {
     #[test]
     fn parse_version_v_prefix_with_label() {
         assert_eq!(parse_version_output("claude v1.0.16"), Some("1.0.16"));
-    }
-
-    #[test]
-    fn compare_major_minor_patch() {
-        assert_eq!(
-            compare_versions("1.2.3", "1.2.3"),
-            std::cmp::Ordering::Equal
-        );
-        assert_eq!(compare_versions("1.2.3", "1.2.4"), std::cmp::Ordering::Less);
-        assert_eq!(
-            compare_versions("1.3.0", "1.2.9"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            compare_versions("2.0.0", "1.99.99"),
-            std::cmp::Ordering::Greater
-        );
     }
 }

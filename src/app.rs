@@ -1,7 +1,7 @@
 use crate::credentials::Plan;
 use crate::data::{
-    claude_version::ClaudeVersion, incidents::StatusData, sessions::SessionData, usage::UsageData,
-    HealthStatus,
+    claude_version::ClaudeVersion, incidents::StatusData, self_version::SelfVersion,
+    sessions::SessionData, usage::UsageData, HealthStatus,
 };
 use crate::error::FetchError;
 use crate::event::{AppEvent, EventRx, EventTx, ResourceKind};
@@ -28,6 +28,7 @@ pub(crate) struct State {
     pub(crate) plan: Option<Plan>,
     pub(crate) account_email: Option<String>,
     pub(crate) claude_version: Option<ClaudeVersion>,
+    pub(crate) self_version: Option<SelfVersion>,
     pub(crate) net_active: u8,
     pub(crate) disk_active: u8,
     pub(crate) tick: u64,
@@ -85,6 +86,9 @@ impl State {
             }
             AppEvent::ClaudeVersionUpdated(version) => {
                 self.claude_version = Some(version);
+            }
+            AppEvent::SelfVersionUpdated(version) => {
+                self.self_version = Some(version);
             }
             AppEvent::ResourceBusy(kind) => match kind {
                 ResourceKind::Network => {
@@ -196,7 +200,8 @@ fn spawn_workers(tx: &EventTx) -> Result<Vec<JoinHandle<()>>> {
     let handles = vec![
         crate::workers::usage::spawn(tx.clone(), client.clone()),
         crate::workers::status::spawn(tx.clone(), client.clone()),
-        crate::workers::claude_version::spawn(tx.clone(), client),
+        crate::workers::claude_version::spawn(tx.clone(), client.clone()),
+        crate::workers::self_version::spawn(tx.clone(), client),
         crate::workers::sessions::spawn(tx.clone()),
     ];
     Ok(handles)
@@ -383,6 +388,39 @@ mod tests {
         let shutdown = state.handle(AppEvent::ClaudeVersionUpdated(version.clone()));
         assert!(!shutdown);
         assert_eq!(state.claude_version, Some(version));
+    }
+
+    #[test]
+    fn handle_self_version_updated() {
+        let mut state = State::default();
+        assert!(state.self_version.is_none());
+        let version = SelfVersion {
+            latest: Some("99.99.99".into()),
+        };
+        let shutdown = state.handle(AppEvent::SelfVersionUpdated(version.clone()));
+        assert!(!shutdown);
+        assert_eq!(state.self_version, Some(version));
+    }
+
+    #[test]
+    fn handle_self_version_updated_replaces_previous() {
+        let mut state = State::default();
+        state.handle(AppEvent::SelfVersionUpdated(SelfVersion {
+            latest: Some("1.0.0".into()),
+        }));
+        let new_version = SelfVersion {
+            latest: Some("2.0.0".into()),
+        };
+        state.handle(AppEvent::SelfVersionUpdated(new_version.clone()));
+        assert_eq!(state.self_version, Some(new_version));
+    }
+
+    #[test]
+    fn handle_self_version_updated_none_latest() {
+        let mut state = State::default();
+        let version = SelfVersion { latest: None };
+        state.handle(AppEvent::SelfVersionUpdated(version.clone()));
+        assert_eq!(state.self_version, Some(version));
     }
 
     #[test]

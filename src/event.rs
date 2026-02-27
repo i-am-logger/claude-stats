@@ -1,5 +1,6 @@
 use crate::data::{
-    claude_version::ClaudeVersion, incidents::StatusData, sessions::SessionData, usage::UsageData,
+    claude_version::ClaudeVersion, incidents::StatusData, self_version::SelfVersion,
+    sessions::SessionData, usage::UsageData,
 };
 use crate::error::FetchError;
 use std::time::Duration;
@@ -27,6 +28,7 @@ pub(crate) enum AppEvent {
     StatusUpdated(Result<StatusData, FetchError>),
     SessionsUpdated(Vec<SessionData>),
     ClaudeVersionUpdated(ClaudeVersion),
+    SelfVersionUpdated(SelfVersion),
     ResourceBusy(ResourceKind),
     ResourceIdle(ResourceKind),
     Key(crossterm::event::KeyEvent),

@@ -24,6 +24,7 @@ pub(crate) fn render(state: &State, frame: &mut Frame<'_>) {
         plan: &state.plan,
         account_email: &state.account_email,
         claude_version: &state.claude_version,
+        self_version: &state.self_version,
     };
     let status = StatusSection {
         status: &state.status,
