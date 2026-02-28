@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.4](https://github.com/i-am-logger/claude-stats/compare/v1.4.3...v1.4.4) (2026-02-28)
+
+
+### Bug Fixes
+
+* detect both foreground and background subagents ([e1787cc](https://github.com/i-am-logger/claude-stats/commit/e1787cc26b616d64e2807c04c0895fa913337e8d))
+
 ## [1.4.3](https://github.com/i-am-logger/claude-stats/compare/v1.4.2...v1.4.3) (2026-02-28)
 
 
