@@ -1,0 +1,32 @@
+# Skip mutants that are untestable without heavy mocking or a real terminal.
+exclude_re = [
+    # UI rendering requires a ratatui Frame (terminal backend).
+    # Match only render-layer files (src/ui/*.rs), not viewmodel submodules.
+    "src/ui/[^/]+\\.rs:.*(render|height)",
+    "in render$",
+    "in render_limit$",
+
+    # Worker spawn functions use async runtime + real I/O
+    "in spawn$",
+    "in setup_watcher$",
+
+    # build_http_client: reqwest::Client has no public accessors
+    "build_http_client",
+
+    # get_installed_version: shells out to `claude --version`
+    "get_installed_version",
+
+    # fetch_latest_version: rate-limit branch has no observable side-effect
+    "fetch_latest_version",
+
+    # SessionCache::scan: reads real filesystem + process detection
+    "SessionCache::scan",
+
+    # scan_proc: reads /proc filesystem
+    "scan_proc",
+
+    # parse_json_line logging guard: mutations to `!line.is_empty()` only change
+    # which lines get a debug log, not the return value (always None).
+    "parse_json_line.* replace !line.is_empty",
+    "delete ! in parse_json_line",
+]

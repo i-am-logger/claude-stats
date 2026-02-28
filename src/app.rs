@@ -538,6 +538,17 @@ mod tests {
     }
 
     #[test]
+    fn handle_usage_updated_at_threshold_is_ok() {
+        let mut state = State::default();
+        let shutdown = state.handle(AppEvent::UsageUpdated {
+            data: Ok(dummy_usage()),
+            elapsed: SLOW_API_THRESHOLD,
+        });
+        assert!(!shutdown);
+        assert_eq!(state.usage_health, HealthStatus::Ok);
+    }
+
+    #[test]
     fn health_composite_worst_case() {
         let mut state = State::default();
         assert_eq!(state.health(), HealthStatus::Ok);

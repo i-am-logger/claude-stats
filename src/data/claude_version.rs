@@ -9,7 +9,7 @@ pub(crate) struct ClaudeVersion {
 impl ClaudeVersion {
     pub(crate) fn is_outdated(&self) -> bool {
         match (&self.installed, &self.latest) {
-            (Some(installed), Some(latest)) if installed != latest => {
+            (Some(installed), Some(latest)) => {
                 crate::fmt::compare_versions(installed, latest) == std::cmp::Ordering::Less
             }
             _ => false,
@@ -42,6 +42,14 @@ fn parse_version_output(stdout: &str) -> Option<&str> {
     })
 }
 
+/// Extract the `version` field from an npm registry JSON response.
+fn extract_npm_version(json: &serde_json::Value) -> Result<String, FetchError> {
+    json["version"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| FetchError::InvalidResponse("missing version field".into()))
+}
+
 pub(crate) async fn fetch_latest_version(client: &reqwest::Client) -> Result<String, FetchError> {
     let resp = client
         .get("https://registry.npmjs.org/@anthropic-ai/claude-code/latest")
@@ -49,10 +57,7 @@ pub(crate) async fn fetch_latest_version(client: &reqwest::Client) -> Result<Str
         .await?;
     let resp = crate::error::check_response(resp).await?;
     let json: serde_json::Value = resp.json().await?;
-    json["version"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| FetchError::InvalidResponse("missing version field".into()))
+    extract_npm_version(&json)
 }
 
 #[cfg(test)]
@@ -91,6 +96,28 @@ mod tests {
         let v = ClaudeVersion::default();
         assert!(!v.is_outdated());
     }
+
+    // ── extract_npm_version ─────────────────────────────────────
+
+    #[test]
+    fn extract_npm_version_valid() {
+        let json = serde_json::json!({"version": "1.0.16"});
+        assert_eq!(extract_npm_version(&json).unwrap(), "1.0.16");
+    }
+
+    #[test]
+    fn extract_npm_version_missing_field() {
+        let json = serde_json::json!({"name": "@anthropic-ai/claude-code"});
+        assert!(extract_npm_version(&json).is_err());
+    }
+
+    #[test]
+    fn extract_npm_version_null_field() {
+        let json = serde_json::json!({"version": null});
+        assert!(extract_npm_version(&json).is_err());
+    }
+
+    // ── parse_version_output ──────────────────────────────────────
 
     #[test]
     fn parse_version_bare_number() {

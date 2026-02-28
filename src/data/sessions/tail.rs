@@ -633,6 +633,26 @@ mod tests {
         assert_eq!(lines, VecDeque::from(["only".to_string()]));
     }
 
+    // ── scan_from_offset last_lines capping ──────────────────────
+
+    #[test]
+    fn scan_from_offset_caps_last_lines_at_recent_lines() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        // Write more lines than RECENT_LINES (5) so the deque must trim
+        for i in 0..8 {
+            writeln!(f, r#"{{"type":"system","n":{i}}}"#).unwrap();
+        }
+        f.as_file().sync_all().unwrap();
+
+        let result = scan_from_offset(f.as_file(), 0);
+        assert_eq!(result.last_lines.len(), RECENT_LINES);
+        // Newest line should be n:7
+        assert!(result.last_lines.back().unwrap().contains("\"n\":7"));
+        // Oldest retained should be n:3
+        assert!(result.last_lines.front().unwrap().contains("\"n\":3"));
+    }
+
     // ── property tests ────────────────────────────────────────────
 
     mod prop {

@@ -10,7 +10,7 @@ pub(crate) struct SelfVersion {
 impl SelfVersion {
     pub(crate) fn is_outdated(&self) -> bool {
         match &self.latest {
-            Some(latest) if latest != CURRENT_VERSION => {
+            Some(latest) => {
                 crate::fmt::compare_versions(CURRENT_VERSION, latest) == std::cmp::Ordering::Less
             }
             _ => false,
@@ -21,6 +21,14 @@ impl SelfVersion {
 /// Strip an optional `v` prefix from a release tag (e.g. "v1.2.0" → "1.2.0").
 fn parse_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
+}
+
+/// Extract the version from a GitHub release JSON response.
+fn extract_github_version(json: &serde_json::Value) -> Result<String, FetchError> {
+    let tag = json["tag_name"]
+        .as_str()
+        .ok_or_else(|| FetchError::InvalidResponse("missing tag_name field".into()))?;
+    Ok(parse_tag(tag).to_string())
 }
 
 pub(crate) async fn fetch_latest_version(client: &reqwest::Client) -> Result<String, FetchError> {
@@ -41,10 +49,7 @@ pub(crate) async fn fetch_latest_version(client: &reqwest::Client) -> Result<Str
     }
     let resp = crate::error::check_response(resp).await?;
     let json: serde_json::Value = resp.json().await?;
-    let tag = json["tag_name"]
-        .as_str()
-        .ok_or_else(|| FetchError::InvalidResponse("missing tag_name field".into()))?;
-    Ok(parse_tag(tag).to_string())
+    extract_github_version(&json)
 }
 
 #[cfg(test)]
@@ -75,6 +80,34 @@ mod tests {
     fn parse_tag_uppercase_v_not_stripped() {
         assert_eq!(parse_tag("V1.2.0"), "V1.2.0");
     }
+
+    // ── extract_github_version ──────────────────────────────────
+
+    #[test]
+    fn extract_github_version_valid() {
+        let json = serde_json::json!({"tag_name": "v1.4.2"});
+        assert_eq!(extract_github_version(&json).unwrap(), "1.4.2");
+    }
+
+    #[test]
+    fn extract_github_version_no_v_prefix() {
+        let json = serde_json::json!({"tag_name": "1.4.2"});
+        assert_eq!(extract_github_version(&json).unwrap(), "1.4.2");
+    }
+
+    #[test]
+    fn extract_github_version_missing_field() {
+        let json = serde_json::json!({"name": "release"});
+        assert!(extract_github_version(&json).is_err());
+    }
+
+    #[test]
+    fn extract_github_version_null_field() {
+        let json = serde_json::json!({"tag_name": null});
+        assert!(extract_github_version(&json).is_err());
+    }
+
+    // ── SelfVersion::is_outdated ─────────────────────────────────
 
     #[test]
     fn outdated_when_latest_is_newer() {

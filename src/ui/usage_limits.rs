@@ -9,9 +9,56 @@ use ratatui::{
     Frame,
 };
 
+// ── viewmodel ────────────────────────────────────────────────
+
 /// When a limit is at 100% and resets in fewer than 1800s (30 min), the timer
 /// colour changes from red to yellow to indicate the reset is imminent.
 const RESET_SOON_SECS: i64 = 1800;
+
+fn usage_height(usage: Option<&UsageData>) -> u16 {
+    if let Some(data) = usage {
+        let mut h = 0u16;
+        if data.five_hour.is_some() {
+            h += 4;
+        }
+        if data.seven_day.is_some() {
+            h += 4;
+        }
+        if data.seven_day_opus.is_some() {
+            h += 4;
+        }
+        if data.seven_day_sonnet.is_some() {
+            h += 4;
+        }
+        h
+    } else {
+        1
+    }
+}
+
+fn timer_color(percent: u16, remaining_secs: i64) -> Color {
+    if percent >= 100 {
+        if remaining_secs > RESET_SOON_SECS {
+            Color::Red
+        } else {
+            Color::Yellow
+        }
+    } else {
+        DIM
+    }
+}
+
+fn no_data_message(fetching: bool, error: Option<&FetchError>) -> (String, Color) {
+    if fetching {
+        ("Loading usage data...".to_string(), DIM)
+    } else if let Some(err) = error {
+        (format!("Error: {err}"), Color::Red)
+    } else {
+        (String::new(), DIM)
+    }
+}
+
+// ── render ───────────────────────────────────────────────────
 
 pub(super) struct UsageLimitsSection<'a> {
     pub(super) usage: &'a Option<UsageData>,
@@ -21,24 +68,7 @@ pub(super) struct UsageLimitsSection<'a> {
 
 impl Section for UsageLimitsSection<'_> {
     fn height(&self, _width: u16) -> u16 {
-        if let Some(ref data) = self.usage {
-            let mut h = 0u16;
-            if data.five_hour.is_some() {
-                h += 4;
-            }
-            if data.seven_day.is_some() {
-                h += 4;
-            }
-            if data.seven_day_opus.is_some() {
-                h += 4;
-            }
-            if data.seven_day_sonnet.is_some() {
-                h += 4;
-            }
-            h
-        } else {
-            1
-        }
+        usage_height(self.usage.as_ref())
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -77,18 +107,7 @@ impl Section for UsageLimitsSection<'_> {
                 }
             }
         } else {
-            let msg = if self.fetching {
-                "Loading usage data...".to_string()
-            } else if let Some(ref err) = self.error {
-                format!("Error: {err}")
-            } else {
-                String::new()
-            };
-            let color = if self.error.is_some() {
-                Color::Red
-            } else {
-                DIM
-            };
+            let (msg, color) = no_data_message(self.fetching, self.error.as_ref());
             let p = Paragraph::new(msg).style(Style::default().fg(color));
             frame.render_widget(p, padded(area));
         }
@@ -103,7 +122,6 @@ fn render_limit(
     i: &mut usize,
 ) {
     let percent = limit.percent();
-
     let color = percent_color(percent);
 
     let title_w = Paragraph::new(Line::from(vec![
@@ -119,22 +137,132 @@ fn render_limit(
     *i += 1;
 
     if let Some(remaining) = limit.remaining_secs() {
-        let timer_color = if percent >= 100 {
-            if remaining > RESET_SOON_SECS {
-                Color::Red
-            } else {
-                Color::Yellow
-            }
-        } else {
-            DIM
-        };
+        let tc = timer_color(percent, remaining);
         let label = limit.remaining_label();
         let timer = Paragraph::new(Line::from(Span::styled(
             format!("Resets in {label}"),
-            Style::default().fg(timer_color),
+            Style::default().fg(tc),
         )));
         let Some(&area) = chunks.get(*i) else { return };
         frame.render_widget(timer, padded(area));
     }
     *i += 1;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── usage_height ─────────────────────────────────────────
+
+    #[test]
+    fn usage_height_no_data() {
+        assert_eq!(usage_height(None), 1);
+    }
+
+    #[test]
+    fn usage_height_no_limits() {
+        let data = UsageData {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+        };
+        assert_eq!(usage_height(Some(&data)), 0);
+    }
+
+    #[test]
+    fn usage_height_one_limit() {
+        let data = UsageData {
+            five_hour: Some(UsageLimit {
+                utilization: Some(50.0),
+                resets_at: None,
+            }),
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+        };
+        assert_eq!(usage_height(Some(&data)), 4);
+    }
+
+    #[test]
+    fn usage_height_all_limits() {
+        let limit = || {
+            Some(UsageLimit {
+                utilization: Some(50.0),
+                resets_at: None,
+            })
+        };
+        let data = UsageData {
+            five_hour: limit(),
+            seven_day: limit(),
+            seven_day_opus: limit(),
+            seven_day_sonnet: limit(),
+        };
+        assert_eq!(usage_height(Some(&data)), 16);
+    }
+
+    // ── timer_color ──────────────────────────────────────────
+
+    #[test]
+    fn timer_color_under_100_is_dim() {
+        assert_eq!(timer_color(50, 3600), DIM);
+    }
+
+    #[test]
+    fn timer_color_at_100_long_reset() {
+        assert_eq!(timer_color(100, 3600), Color::Red);
+    }
+
+    #[test]
+    fn timer_color_at_100_soon_reset() {
+        assert_eq!(timer_color(100, 1800), Color::Yellow);
+    }
+
+    #[test]
+    fn timer_color_at_100_boundary() {
+        assert_eq!(timer_color(100, 1801), Color::Red);
+    }
+
+    #[test]
+    fn timer_color_over_100_soon() {
+        assert_eq!(timer_color(150, 0), Color::Yellow);
+    }
+
+    // ── no_data_message ──────────────────────────────────────
+
+    #[test]
+    fn no_data_fetching() {
+        let (msg, color) = no_data_message(true, None);
+        assert_eq!(msg, "Loading usage data...");
+        assert_eq!(color, DIM);
+    }
+
+    #[test]
+    fn no_data_error() {
+        let err = FetchError::Timeout;
+        let (msg, color) = no_data_message(false, Some(&err));
+        assert!(msg.starts_with("Error:"));
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn no_data_empty() {
+        let (msg, color) = no_data_message(false, None);
+        assert!(msg.is_empty());
+        assert_eq!(color, DIM);
+    }
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn prop_timer_color_deterministic(percent in 0..=200_u16, secs in 0..=7200_i64) {
+                let c = timer_color(percent, secs);
+                prop_assert!(c == Color::Red || c == Color::Yellow || c == DIM);
+            }
+        }
+    }
 }

@@ -57,24 +57,11 @@ fn state_from_assistant(val: &Value) -> SessionState {
         return SessionState::Working;
     }
 
-    let has_thinking = content
-        .iter()
-        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"));
-
     // Complete if stop_reason is present and non-null
     let is_complete = val
         .pointer("/message/stop_reason")
         .is_some_and(|sr| !sr.is_null());
 
-    if has_thinking {
-        return if is_complete {
-            SessionState::Idle
-        } else {
-            SessionState::Thinking
-        };
-    }
-
-    // Text-only: still streaming → thinking, complete → idle
     if is_complete {
         SessionState::Idle
     } else {
@@ -692,6 +679,26 @@ mod tests {
             "message": {"content": [{"type": "text", "text": "hi"}]}
         });
         assert_eq!(extract_tool_names(&val), "working");
+    }
+
+    // ── detect_state_from_tail ────────────────────────────────────
+
+    #[test]
+    fn detect_state_from_tail_skips_metadata() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        // metadata, working-assistant, metadata — state should come from the assistant line
+        let metadata = r#"{"type":"tag","value":"v1"}"#;
+        let working = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],"stop_reason":null}}"#;
+        writeln!(f, "{metadata}").unwrap();
+        writeln!(f, "{working}").unwrap();
+        writeln!(f, "{metadata}").unwrap();
+        f.as_file().sync_all().unwrap();
+
+        let file = fs::File::open(f.path()).unwrap();
+        let file_len = file.metadata().unwrap().len();
+        let state = detect_state_from_tail(&file, file_len);
+        assert_eq!(state, SessionState::Working);
     }
 
     // ── property tests ────────────────────────────────────────────

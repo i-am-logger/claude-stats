@@ -163,6 +163,8 @@ fn parse_model(model: &str) -> ModelShort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::sessions::testutil::write_agent_file;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_model_opus() {
@@ -191,24 +193,12 @@ mod tests {
 
     // ── scan_subagents tests ────────────────────────────────────
 
-    /// Write a minimal subagent JSONL file.
-    fn write_agent_file(dir: &Path, agent_id: &str, task: &str) {
-        use std::io::Write;
-        let path = dir.join(format!("agent-{agent_id}.jsonl"));
-        let user_line = format!(r#"{{"type":"user","message":{{"content":"{task}"}}}}"#);
-        let usage = r#"{"type":"assistant","message":{"usage":{"input_tokens":1000},"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}}"#;
-        let mut f = fs::File::create(path).unwrap();
-        writeln!(f, "{user_line}").unwrap();
-        writeln!(f, "{usage}").unwrap();
-        f.sync_all().unwrap();
-    }
-
     #[test]
     fn scan_subagents_filters_by_active_ids() {
         let dir = tempfile::tempdir().unwrap();
-        write_agent_file(dir.path(), "aaa", "Task A");
-        write_agent_file(dir.path(), "bbb", "Task B");
-        write_agent_file(dir.path(), "ccc", "Task C");
+        write_agent_file(dir.path(), "aaa", "Task A", 1000);
+        write_agent_file(dir.path(), "bbb", "Task B", 1000);
+        write_agent_file(dir.path(), "ccc", "Task C", 1000);
 
         let active: HashSet<String> = ["aaa", "ccc"].iter().map(|s| (*s).to_string()).collect();
         let agents = scan_subagents(dir.path(), &active);
@@ -222,7 +212,7 @@ mod tests {
     #[test]
     fn scan_subagents_empty_active_ids() {
         let dir = tempfile::tempdir().unwrap();
-        write_agent_file(dir.path(), "aaa", "Task A");
+        write_agent_file(dir.path(), "aaa", "Task A", 1000);
 
         let active: HashSet<String> = HashSet::new();
         let agents = scan_subagents(dir.path(), &active);
@@ -349,6 +339,54 @@ mod tests {
             task_from_array_content("First line\nSecond line"),
             "First line"
         );
+    }
+
+    // ── read_subagent_usage via parse_subagent ─────────────────────
+
+    /// Write a subagent file with known model and token counts, then verify
+    /// `parse_subagent` extracts them correctly.
+    fn write_usage_agent(dir: &Path, model: &str, input_tokens: u64) -> PathBuf {
+        use std::io::Write;
+        let path = dir.join("agent-usage_test.jsonl");
+        let user_line = r#"{"type":"user","message":{"content":"test task"}}"#;
+        let usage = format!(
+            r#"{{"type":"assistant","message":{{"model":"{model}","usage":{{"input_tokens":{input_tokens}}},"content":[{{"type":"text","text":"ok"}}],"stop_reason":"end_turn"}}}}"#
+        );
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{user_line}").unwrap();
+        writeln!(f, "{usage}").unwrap();
+        f.sync_all().unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_subagent_extracts_model_and_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_usage_agent(dir.path(), "claude-sonnet-4-20250514", 12_345);
+        let agent = parse_subagent(&path).unwrap();
+        assert_eq!(agent.model, ModelShort::Sonnet);
+        assert_eq!(agent.context_tokens, 12_345);
+    }
+
+    #[test]
+    fn parse_subagent_zero_tokens_not_overwritten() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-zero_test.jsonl");
+        let user_line = r#"{"type":"user","message":{"content":"test"}}"#;
+        // First usage with positive tokens, then one with zero
+        let usage1 = r#"{"type":"assistant","message":{"model":"claude-opus-4-20250514","usage":{"input_tokens":5000},"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}}"#;
+        let usage2 = r#"{"type":"assistant","message":{"model":"claude-opus-4-20250514","usage":{"input_tokens":0},"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}}"#;
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "{user_line}").unwrap();
+        writeln!(f, "{usage1}").unwrap();
+        writeln!(f, "{usage2}").unwrap();
+        f.sync_all().unwrap();
+
+        let agent = parse_subagent(&path).unwrap();
+        // Zero-token usage should not overwrite the previous positive value
+        assert_eq!(agent.context_tokens, 5000);
+        assert_eq!(agent.model, ModelShort::Opus);
     }
 
     // ── property tests ────────────────────────────────────────────
