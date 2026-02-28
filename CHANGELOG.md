@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.3](https://github.com/i-am-logger/claude-stats/compare/v1.4.2...v1.4.3) (2026-02-28)
+
+
+### Bug Fixes
+
+* co-locate viewmodels, extract session cache, kill missed mutants ([97affec](https://github.com/i-am-logger/claude-stats/commit/97affecd551ec5860df4027e0db114ad4166f437))
+
 ## [1.4.2](https://github.com/i-am-logger/claude-stats/compare/v1.4.1...v1.4.2) (2026-02-27)
 
 
