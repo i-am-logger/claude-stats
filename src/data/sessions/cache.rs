@@ -21,10 +21,7 @@ struct CachedEntry {
     compactions: u32,
     last_lines: VecDeque<String>,
     bytes_read: u64,
-    /// `agentId` → `parentToolUseID` mapping from `agent_progress` entries.
-    agent_tool_map: HashMap<String, String>,
-    /// Set of `tool_use_id` values that have received a `tool_result`.
-    completed_tool_ids: HashSet<String>,
+    tracker: tail::AgentTracker,
 }
 
 impl CachedEntry {
@@ -36,8 +33,7 @@ impl CachedEntry {
             compactions: data.compactions,
             last_lines: data.last_lines,
             bytes_read: file_len,
-            agent_tool_map: data.agent_tool_map,
-            completed_tool_ids: data.completed_tool_ids,
+            tracker: data.tracker,
         }
     }
 }
@@ -51,15 +47,6 @@ struct SessionFileResult {
     last_tokens: u64,
     compactions: u32,
     last_lines: VecDeque<String>,
-}
-
-/// Compute the set of agent IDs that are still active (have `agent_progress`
-/// entries but no corresponding `tool_result`).
-fn active_agent_ids(map: &HashMap<String, String>, completed: &HashSet<String>) -> HashSet<String> {
-    map.iter()
-        .filter(|(_, tool_id)| !completed.contains(*tool_id))
-        .map(|(agent_id, _)| agent_id.clone())
-        .collect()
 }
 
 /// Caches session file state across polls. First encounter does a full read;
@@ -216,10 +203,7 @@ impl SessionCache {
                         cached.last_lines.pop_front();
                     }
                     cached.bytes_read = file_len;
-                    for (agent_id, tool_id) in result.agent_tool_map {
-                        cached.agent_tool_map.entry(agent_id).or_insert(tool_id);
-                    }
-                    cached.completed_tool_ids.extend(result.completed_tool_ids);
+                    cached.tracker.merge(&result.tracker);
                     Some(Self::result_from_cache(cached))
                 }
                 std::cmp::Ordering::Equal => Some(Self::result_from_cache(cached)),
@@ -282,7 +266,7 @@ impl SessionCache {
         let Some(cached) = self.entries.get(path) else {
             return HashSet::new();
         };
-        active_agent_ids(&cached.agent_tool_map, &cached.completed_tool_ids)
+        cached.tracker.active_ids()
     }
 }
 
@@ -290,7 +274,8 @@ impl SessionCache {
 mod tests {
     use super::*;
     use crate::data::sessions::testutil::{
-        assistant_usage_line, jsonl_file, progress_line, tool_result_line, write_agent_file,
+        assistant_usage_line, async_agent_launch_line, jsonl_file, progress_line,
+        queue_operation_complete_line, tool_result_line, write_agent_file,
     };
     use std::io::{Seek, SeekFrom, Write};
 
@@ -582,10 +567,10 @@ mod tests {
     // ── active agent tracking ─────────────────────────────────
 
     /// Helper: scan a temp file from offset 0 and return the set of active
-    /// agent IDs using `scan_from_offset` + `active_agent_ids`.
+    /// agent IDs using `scan_from_offset` + `AgentTracker::active_ids`.
     fn active_ids_from(f: &tempfile::NamedTempFile) -> HashSet<String> {
         let result = tail::scan_from_offset(f.as_file(), 0);
-        active_agent_ids(&result.agent_tool_map, &result.completed_tool_ids)
+        result.tracker.active_ids()
     }
 
     #[test]
@@ -658,8 +643,8 @@ mod tests {
         // First parse (full scan): both agents tracked in cache
         let _session = cache.parse_session(f.path(), 1).unwrap();
         let cached = cache.entries.get(f.path()).unwrap();
-        assert_eq!(cached.agent_tool_map.len(), 2);
-        assert!(cached.completed_tool_ids.is_empty());
+        let active = cached.tracker.active_ids();
+        assert_eq!(active.len(), 2);
 
         // Append a tool_result for agent_a
         let r1 = tool_result_line("toolu_001");
@@ -669,10 +654,7 @@ mod tests {
         // Second parse (incremental): cache merges the new tool_result
         let _session = cache.parse_session(f.path(), 1).unwrap();
         let cached = cache.entries.get(f.path()).unwrap();
-        assert_eq!(cached.agent_tool_map.len(), 2);
-        assert!(cached.completed_tool_ids.contains("toolu_001"));
-
-        let active = active_agent_ids(&cached.agent_tool_map, &cached.completed_tool_ids);
+        let active = cached.tracker.active_ids();
         assert_eq!(active.len(), 1);
         assert!(active.contains("agent_b"));
     }
@@ -770,7 +752,7 @@ mod tests {
         // First parse — agent_x should be in the cache
         let _session = cache.parse_session(f.path(), 1).unwrap();
         let cached = cache.entries.get(f.path()).unwrap();
-        assert!(cached.agent_tool_map.contains_key("agent_x"));
+        assert!(cached.tracker.active_ids().contains("agent_x"));
 
         // Truncate and rewrite without agent data
         f.as_file().set_len(0).unwrap();
@@ -781,11 +763,10 @@ mod tests {
         writeln!(&f, "{idle}").unwrap();
         f.as_file().sync_all().unwrap();
 
-        // After shrink, agent maps should be rebuilt (empty)
+        // After shrink, agent tracker should be rebuilt (empty)
         let _session = cache.parse_session(f.path(), 1).unwrap();
         let cached = cache.entries.get(f.path()).unwrap();
-        assert!(cached.agent_tool_map.is_empty());
-        assert!(cached.completed_tool_ids.is_empty());
+        assert!(cached.tracker.active_ids().is_empty());
     }
 
     // ── integration: parse_session with subagents ────────────────
@@ -842,5 +823,144 @@ mod tests {
         // Only the active agent (not the completed one) should appear
         assert_eq!(session.agents.len(), 1);
         assert_eq!(session.agents[0].task, "Search for tests");
+    }
+
+    #[test]
+    fn parse_session_with_background_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let session_id = "test-session-bg";
+        let parent_path = dir.path().join(format!("{session_id}.jsonl"));
+
+        let user_line = r#"{"type":"user","cwd":"/home/user/proj","gitBranch":"main","message":{"content":"go"}}"#;
+        let usage = assistant_usage_line(10_000);
+        // Launch a background agent
+        let bg_launch = async_agent_launch_line("toolu_bg_001", "bg_active", "Background search");
+        // Launch and complete another background agent
+        let bg_launch2 = async_agent_launch_line("toolu_bg_002", "bg_done", "Background lint");
+        let bg_complete = queue_operation_complete_line("bg_done");
+        // End with working state (tool_use + progress for state detection)
+        let tool_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],"stop_reason":null}}"#;
+        let progress = r#"{"type":"progress","data":{"type":"bash_progress","output":"file.rs"}}"#;
+
+        {
+            let mut f = fs::File::create(&parent_path).unwrap();
+            for line in [
+                user_line,
+                &*usage,
+                &*bg_launch,
+                &*bg_launch2,
+                &*bg_complete,
+                tool_use,
+                progress,
+            ] {
+                writeln!(f, "{line}").unwrap();
+            }
+            f.sync_all().unwrap();
+        }
+
+        // Create subagent files
+        let subagents_dir = dir.path().join(session_id).join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+
+        write_agent_file(&subagents_dir, "bg_active", "Background search", 5_000);
+        write_agent_file(&subagents_dir, "bg_done", "Background lint", 3_000);
+
+        let mut cache = SessionCache::new();
+        let session = cache.parse_session(&parent_path, 1).unwrap();
+
+        assert_eq!(session.state, SessionState::Working);
+        // Only the active background agent should appear
+        assert_eq!(session.agents.len(), 1);
+        assert_eq!(session.agents[0].task, "Background search");
+    }
+
+    #[test]
+    fn active_agents_incremental_scan_background() {
+        let user_line =
+            r#"{"type":"user","cwd":"/tmp/proj","gitBranch":"main","message":{"content":"go"}}"#;
+        let usage = assistant_usage_line(10_000);
+        let bg_launch = async_agent_launch_line("toolu_bg_001", "bg_agent", "search");
+        let tool_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],"stop_reason":null}}"#;
+
+        let f = jsonl_file(&[user_line, &usage, &bg_launch, tool_use]);
+        let mut cache = SessionCache::new();
+
+        // First parse (full scan): background agent tracked
+        let _session = cache.parse_session(f.path(), 1).unwrap();
+        let cached = cache.entries.get(f.path()).unwrap();
+        let active = cached.tracker.active_ids();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains("bg_agent"));
+
+        // Append queue-operation completion for the background agent
+        let bg_complete = queue_operation_complete_line("bg_agent");
+        writeln!(&f, "{bg_complete}").unwrap();
+        f.as_file().sync_all().unwrap();
+
+        // Second parse (incremental): merge should mark background agent done
+        let _session = cache.parse_session(f.path(), 1).unwrap();
+        let cached = cache.entries.get(f.path()).unwrap();
+        assert!(cached.tracker.active_ids().is_empty());
+    }
+
+    #[test]
+    fn parse_session_mixed_foreground_and_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "test-session-mixed";
+        let parent_path = dir.path().join(format!("{session_id}.jsonl"));
+
+        let user_line = r#"{"type":"user","cwd":"/home/user/proj","gitBranch":"dev","message":{"content":"go"}}"#;
+        let usage = assistant_usage_line(10_000);
+        // Foreground agent — completed
+        let fg_progress = progress_line("fg_done", "toolu_fg_001");
+        let fg_result = tool_result_line("toolu_fg_001");
+        // Foreground agent — still active
+        let fg_active_progress = progress_line("fg_active", "toolu_fg_002");
+        // Background agent — completed (realistic content format)
+        let bg_launch = async_agent_launch_line("toolu_bg_001", "bg_done", "Run tests");
+        let bg_complete = queue_operation_complete_line("bg_done");
+        // Background agent — still active
+        let bg_launch2 = async_agent_launch_line("toolu_bg_002", "bg_active", "Lint code");
+        // End with working state
+        let tool_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],"stop_reason":null}}"#;
+        let progress = r#"{"type":"progress","data":{"type":"bash_progress","output":"ok"}}"#;
+
+        {
+            let mut f = fs::File::create(&parent_path).unwrap();
+            for line in [
+                user_line,
+                &*usage,
+                &*fg_progress,
+                &*fg_result,
+                &*fg_active_progress,
+                &*bg_launch,
+                &*bg_complete,
+                &*bg_launch2,
+                tool_use,
+                progress,
+            ] {
+                writeln!(f, "{line}").unwrap();
+            }
+            f.sync_all().unwrap();
+        }
+
+        // Create subagent files for all four agents
+        let subagents_dir = dir.path().join(session_id).join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+        write_agent_file(&subagents_dir, "fg_done", "Completed fg task", 2_000);
+        write_agent_file(&subagents_dir, "fg_active", "Active fg task", 3_000);
+        write_agent_file(&subagents_dir, "bg_done", "Run tests", 4_000);
+        write_agent_file(&subagents_dir, "bg_active", "Lint code", 5_000);
+
+        let mut cache = SessionCache::new();
+        let session = cache.parse_session(&parent_path, 1).unwrap();
+
+        assert_eq!(session.state, SessionState::Working);
+        // Only fg_active and bg_active should appear (2 agents active)
+        assert_eq!(session.agents.len(), 2);
+        let tasks: HashSet<&str> = session.agents.iter().map(|a| a.task.as_str()).collect();
+        assert!(tasks.contains("Active fg task"));
+        assert!(tasks.contains("Lint code"));
     }
 }

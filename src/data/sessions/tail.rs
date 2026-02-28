@@ -15,6 +15,135 @@ const _: () = assert!(CONTEXT_WINDOW > 0);
 /// Number of recent lines to retain for state detection.
 pub(crate) const RECENT_LINES: usize = 5;
 
+/// How a subagent was launched — determines completion detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentKind {
+    /// Streams progress to parent. Completed when `tool_result` arrives
+    /// for `parent_tool_use_id`.
+    Foreground { parent_tool_use_id: String },
+    /// Runs independently. Completed when a `queue-operation` enqueue
+    /// with `<task-id>` and `<status>completed</status>` appears.
+    Background,
+}
+
+/// Tracks all subagents observed in a session JSONL.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgentTracker {
+    agents: HashMap<String, AgentKind>,
+    /// `tool_use_id`s that received a `tool_result` (foreground completion).
+    completed_tool_ids: HashSet<String>,
+    /// Agent IDs that received a queue-operation completion (background).
+    completed_background_ids: HashSet<String>,
+}
+
+impl AgentTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Extract agent data from a single parsed JSONL value.
+    pub fn process(&mut self, val: &serde_json::Value) {
+        match val.get("type").and_then(|t| t.as_str()) {
+            Some("progress") => {
+                if val.pointer("/data/type").and_then(|t| t.as_str()) != Some("agent_progress") {
+                    return;
+                }
+                if let (Some(agent_id), Some(tool_id)) = (
+                    val.pointer("/data/agentId")
+                        .and_then(serde_json::Value::as_str),
+                    val.get("parentToolUseID")
+                        .and_then(serde_json::Value::as_str),
+                ) {
+                    self.agents.entry(agent_id.to_string()).or_insert_with(|| {
+                        AgentKind::Foreground {
+                            parent_tool_use_id: tool_id.to_string(),
+                        }
+                    });
+                }
+            }
+            Some("user") => {
+                // tool_result items mark foreground completion
+                if let Some(content) = val.pointer("/message/content").and_then(|v| v.as_array()) {
+                    for item in content {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                            if let Some(id) =
+                                item.get("tool_use_id").and_then(serde_json::Value::as_str)
+                            {
+                                self.completed_tool_ids.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+
+                // toolUseResult with isAsync: true → Background agent
+                if let Some(tur) = val.pointer("/toolUseResult") {
+                    if tur.get("isAsync").and_then(serde_json::Value::as_bool) == Some(true) {
+                        if let Some(agent_id) =
+                            tur.get("agentId").and_then(serde_json::Value::as_str)
+                        {
+                            self.agents
+                                .entry(agent_id.to_string())
+                                .or_insert(AgentKind::Background);
+                        }
+                    }
+                }
+            }
+            Some("queue-operation") => {
+                if val.get("operation").and_then(|o| o.as_str()) != Some("enqueue") {
+                    return;
+                }
+                if let Some(content) = val.get("content").and_then(|c| c.as_str()) {
+                    let mut task_id = None;
+                    let mut completed = false;
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if let Some(id) = line
+                            .strip_prefix("<task-id>")
+                            .and_then(|s| s.strip_suffix("</task-id>"))
+                        {
+                            task_id = Some(id);
+                        }
+                        if line == "<status>completed</status>" {
+                            completed = true;
+                        }
+                    }
+                    if let (true, Some(id)) = (completed, task_id) {
+                        self.completed_background_ids.insert(id.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Merge incremental scan results into this tracker.
+    pub fn merge(&mut self, other: &Self) {
+        for (id, kind) in &other.agents {
+            self.agents
+                .entry(id.clone())
+                .or_insert_with(|| kind.clone());
+        }
+        self.completed_tool_ids
+            .extend(other.completed_tool_ids.iter().cloned());
+        self.completed_background_ids
+            .extend(other.completed_background_ids.iter().cloned());
+    }
+
+    /// Return the set of agent IDs that are still active.
+    pub fn active_ids(&self) -> HashSet<String> {
+        self.agents
+            .iter()
+            .filter(|(id, kind)| match kind {
+                AgentKind::Foreground { parent_tool_use_id } => {
+                    !self.completed_tool_ids.contains(parent_tool_use_id)
+                }
+                AgentKind::Background => !self.completed_background_ids.contains(id.as_str()),
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
 /// Result of scanning an entire session file in a single pass.
 #[derive(Debug)]
 pub struct SessionFileData {
@@ -23,10 +152,7 @@ pub struct SessionFileData {
     pub last_tokens: u64,
     pub compactions: u32,
     pub last_lines: VecDeque<String>,
-    /// `agentId` → `parentToolUseID` mapping from `agent_progress` entries.
-    pub agent_tool_map: HashMap<String, String>,
-    /// Set of `tool_use_id` values that have received a `tool_result`.
-    pub completed_tool_ids: HashSet<String>,
+    pub(crate) tracker: AgentTracker,
 }
 
 /// Seek to `seek_pos` in the file, discard the partial first line if not at
@@ -61,8 +187,7 @@ struct ScanState {
     last_tokens: u64,
     compactions: u32,
     recent: VecDeque<String>,
-    agent_tool_map: HashMap<String, String>,
-    completed_tool_ids: HashSet<String>,
+    tracker: AgentTracker,
 }
 
 impl ScanState {
@@ -71,8 +196,7 @@ impl ScanState {
             last_tokens: 0,
             compactions: 0,
             recent: VecDeque::new(),
-            agent_tool_map: HashMap::new(),
-            completed_tool_ids: HashSet::new(),
+            tracker: AgentTracker::new(),
         }
     }
 
@@ -107,7 +231,7 @@ impl ScanState {
             }
         }
 
-        extract_agent_data(val, &mut self.agent_tool_map, &mut self.completed_tool_ids);
+        self.tracker.process(val);
     }
 
     fn into_result(self) -> ScanResult {
@@ -115,8 +239,7 @@ impl ScanState {
             last_tokens: self.last_tokens,
             compactions: self.compactions,
             last_lines: self.recent,
-            agent_tool_map: self.agent_tool_map,
-            completed_tool_ids: self.completed_tool_ids,
+            tracker: self.tracker,
         }
     }
 }
@@ -167,8 +290,7 @@ pub fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
         last_tokens: result.last_tokens,
         compactions: result.compactions,
         last_lines: result.last_lines,
-        agent_tool_map: result.agent_tool_map,
-        completed_tool_ids: result.completed_tool_ids,
+        tracker: result.tracker,
     })
 }
 
@@ -178,10 +300,7 @@ pub struct ScanResult {
     pub last_tokens: u64,
     pub compactions: u32,
     pub last_lines: VecDeque<String>,
-    /// `agentId` → `parentToolUseID` mapping from `agent_progress` entries.
-    pub agent_tool_map: HashMap<String, String>,
-    /// Set of `tool_use_id` values that have received a `tool_result`.
-    pub completed_tool_ids: HashSet<String>,
+    pub(crate) tracker: AgentTracker,
 }
 
 /// Scan a session file from `offset` to EOF. Tracks token usage, compaction
@@ -216,45 +335,6 @@ pub fn is_assistant_usage(val: &serde_json::Value) -> bool {
         val.get("type").and_then(|t| t.as_str()),
         Some("assistant" | "message")
     ) && val.pointer("/message/usage").is_some()
-}
-
-/// Extract agent tracking data from a single JSON line.
-///
-/// Looks for `agent_progress` entries (maps agentId → parentToolUseID) and
-/// user messages containing `tool_result` items (marks `tool_use_ids` as
-/// completed).
-fn extract_agent_data(
-    val: &serde_json::Value,
-    agent_tool_map: &mut HashMap<String, String>,
-    completed_tool_ids: &mut HashSet<String>,
-) {
-    // agent_progress: maps agentId → parentToolUseID
-    if val.pointer("/data/type").and_then(|t| t.as_str()) == Some("agent_progress") {
-        if let (Some(agent_id), Some(tool_id)) = (
-            val.pointer("/data/agentId")
-                .and_then(serde_json::Value::as_str),
-            val.get("parentToolUseID")
-                .and_then(serde_json::Value::as_str),
-        ) {
-            agent_tool_map
-                .entry(agent_id.to_string())
-                .or_insert_with(|| tool_id.to_string());
-        }
-    }
-
-    // tool_result in user messages: marks tool_use_ids as completed.
-    // Only user messages carry tool_result items, so skip other line types.
-    if val.get("type").and_then(|t| t.as_str()) == Some("user") {
-        if let Some(content) = val.pointer("/message/content").and_then(|v| v.as_array()) {
-            for item in content {
-                if item.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                    if let Some(id) = item.get("tool_use_id").and_then(serde_json::Value::as_str) {
-                        completed_tool_ids.insert(id.to_string());
-                    }
-                }
-            }
-        }
-    }
 }
 
 pub fn extract_tokens(usage: &serde_json::Value) -> u64 {
@@ -441,64 +521,162 @@ mod tests {
         assert_eq!(extract_tokens(&usage), u64::MAX);
     }
 
-    // ── extract_agent_data ─────────────────────────────────────────
+    // ── AgentTracker ───────────────────────────────────────────────
 
     #[test]
-    fn extract_agent_data_progress_entry() {
+    fn tracker_foreground_agent_via_progress() {
         let val = serde_json::json!({
             "type": "progress",
             "parentToolUseID": "toolu_001",
             "data": {"type": "agent_progress", "agentId": "abc123"}
         });
-        let mut map = HashMap::new();
-        let mut completed = HashSet::new();
-        extract_agent_data(&val, &mut map, &mut completed);
-        assert_eq!(map.get("abc123").unwrap(), "toolu_001");
-        assert!(completed.is_empty());
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert_eq!(
+            tracker.agents.get("abc123"),
+            Some(&AgentKind::Foreground {
+                parent_tool_use_id: "toolu_001".into()
+            })
+        );
+        assert!(tracker.active_ids().contains("abc123"));
     }
 
     #[test]
-    fn extract_agent_data_tool_result_in_user_message() {
+    fn tracker_foreground_agent_completed() {
+        let progress = serde_json::json!({
+            "type": "progress",
+            "parentToolUseID": "toolu_001",
+            "data": {"type": "agent_progress", "agentId": "abc123"}
+        });
+        let result = serde_json::json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_001", "content": "done"}
+            ]}
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&progress);
+        tracker.process(&result);
+        assert!(tracker.active_ids().is_empty());
+    }
+
+    #[test]
+    fn tracker_background_agent_via_tool_use_result() {
+        let val = serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "isAsync": true,
+                "status": "async_launched",
+                "agentId": "bg_abc"
+            },
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_099", "content": "launched"}
+            ]}
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert_eq!(tracker.agents.get("bg_abc"), Some(&AgentKind::Background));
+        assert!(tracker.active_ids().contains("bg_abc"));
+    }
+
+    #[test]
+    fn tracker_background_agent_completed_via_queue_op() {
+        let launch = serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "isAsync": true,
+                "status": "async_launched",
+                "agentId": "bg_abc"
+            },
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_099", "content": "launched"}
+            ]}
+        });
+        let complete = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "<task-notification>\n<task-id>bg_abc</task-id>\n<status>completed</status>\n</task-notification>"
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&launch);
+        tracker.process(&complete);
+        assert!(tracker.active_ids().is_empty());
+    }
+
+    #[test]
+    fn tracker_background_no_false_positive() {
+        // Normal tool_result without isAsync should NOT add a background agent
         let val = serde_json::json!({
             "type": "user",
             "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "toolu_001", "content": "done"}
             ]}
         });
-        let mut map = HashMap::new();
-        let mut completed = HashSet::new();
-        extract_agent_data(&val, &mut map, &mut completed);
-        assert!(map.is_empty());
-        assert!(completed.contains("toolu_001"));
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.agents.is_empty());
+        assert!(tracker.active_ids().is_empty());
     }
 
     #[test]
-    fn extract_agent_data_ignores_non_user_content() {
-        // Assistant messages with content array should NOT extract tool_result
-        let val = serde_json::json!({
-            "type": "assistant",
+    fn tracker_active_ids_mixed() {
+        let mut tracker = AgentTracker::new();
+
+        // Foreground agent — completed
+        let fg_progress = serde_json::json!({
+            "type": "progress",
+            "parentToolUseID": "toolu_001",
+            "data": {"type": "agent_progress", "agentId": "fg_done"}
+        });
+        let fg_result = serde_json::json!({
+            "type": "user",
             "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "toolu_001", "content": "done"}
             ]}
         });
-        let mut map = HashMap::new();
-        let mut completed = HashSet::new();
-        extract_agent_data(&val, &mut map, &mut completed);
-        assert!(completed.is_empty());
+        tracker.process(&fg_progress);
+        tracker.process(&fg_result);
+
+        // Background agent — still active
+        let bg_launch = serde_json::json!({
+            "type": "user",
+            "toolUseResult": {"isAsync": true, "agentId": "bg_active"},
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_002", "content": "launched"}
+            ]}
+        });
+        tracker.process(&bg_launch);
+
+        let active = tracker.active_ids();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains("bg_active"));
+        assert!(!active.contains("fg_done"));
     }
 
     #[test]
-    fn extract_agent_data_irrelevant_line() {
-        let val = serde_json::json!({"type": "system", "subtype": "init"});
-        let mut map = HashMap::new();
-        let mut completed = HashSet::new();
-        extract_agent_data(&val, &mut map, &mut completed);
-        assert!(map.is_empty());
-        assert!(completed.is_empty());
+    fn tracker_merge_combines_both() {
+        let mut a = AgentTracker::new();
+        a.agents.insert(
+            "fg1".into(),
+            AgentKind::Foreground {
+                parent_tool_use_id: "t1".into(),
+            },
+        );
+        a.completed_tool_ids.insert("t1".into());
+
+        let mut b = AgentTracker::new();
+        b.agents.insert("bg1".into(), AgentKind::Background);
+
+        a.merge(&b);
+        assert_eq!(a.agents.len(), 2);
+        assert!(a.agents.contains_key("bg1"));
+        // fg1 should still be completed
+        assert!(a.active_ids().contains("bg1"));
+        assert!(!a.active_ids().contains("fg1"));
     }
 
     #[test]
-    fn extract_agent_data_first_tool_id_wins() {
+    fn tracker_foreground_first_tool_id_wins() {
         let p1 = serde_json::json!({
             "type": "progress",
             "parentToolUseID": "toolu_001",
@@ -509,37 +687,86 @@ mod tests {
             "parentToolUseID": "toolu_999",
             "data": {"type": "agent_progress", "agentId": "abc"}
         });
-        let mut map = HashMap::new();
-        let mut completed = HashSet::new();
-        extract_agent_data(&p1, &mut map, &mut completed);
-        extract_agent_data(&p2, &mut map, &mut completed);
-        // First insertion wins (or_insert_with)
-        assert_eq!(map.get("abc").unwrap(), "toolu_001");
+        let mut tracker = AgentTracker::new();
+        tracker.process(&p1);
+        tracker.process(&p2);
+        assert_eq!(
+            tracker.agents.get("abc"),
+            Some(&AgentKind::Foreground {
+                parent_tool_use_id: "toolu_001".into()
+            })
+        );
     }
 
     #[test]
-    fn extract_agent_data_missing_agent_id() {
+    fn tracker_missing_agent_id_ignored() {
         let val = serde_json::json!({
             "type": "progress",
             "parentToolUseID": "toolu_001",
             "data": {"type": "agent_progress"}
         });
-        let mut map = HashMap::new();
-        let mut completed = HashSet::new();
-        extract_agent_data(&val, &mut map, &mut completed);
-        assert!(map.is_empty());
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.agents.is_empty());
     }
 
     #[test]
-    fn extract_agent_data_missing_parent_tool_use_id() {
+    fn tracker_missing_parent_tool_use_id_ignored() {
         let val = serde_json::json!({
             "type": "progress",
             "data": {"type": "agent_progress", "agentId": "abc"}
         });
-        let mut map = HashMap::new();
-        let mut completed = HashSet::new();
-        extract_agent_data(&val, &mut map, &mut completed);
-        assert!(map.is_empty());
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.agents.is_empty());
+    }
+
+    #[test]
+    fn tracker_ignores_non_user_tool_result() {
+        // Assistant messages with tool_result should NOT mark completion
+        let val = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_001", "content": "done"}
+            ]}
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.completed_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn tracker_irrelevant_line_ignored() {
+        let val = serde_json::json!({"type": "system", "subtype": "init"});
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.agents.is_empty());
+        assert!(tracker.completed_tool_ids.is_empty());
+        assert!(tracker.completed_background_ids.is_empty());
+    }
+
+    #[test]
+    fn tracker_queue_op_non_completed_ignored() {
+        let val = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "<task-notification>\n<task-id>bg_abc</task-id>\n<status>running</status>\n</task-notification>"
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.completed_background_ids.is_empty());
+    }
+
+    #[test]
+    fn tracker_queue_op_no_status_ignored() {
+        let val = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "please remember to always use proper architecture"
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.completed_background_ids.is_empty());
     }
 
     // ── seek_tail ──────────────────────────────────────────────────
