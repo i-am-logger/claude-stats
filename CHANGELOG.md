@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.5](https://github.com/i-am-logger/claude-stats/compare/v1.4.4...v1.4.5) (2026-03-04)
+
+
+### Bug Fixes
+
+* show multiple Claude instances from same directory as separate sessions ([201b365](https://github.com/i-am-logger/claude-stats/commit/201b36599c141398d8bbf31a419c5749ebe52379))
+
 ## [1.4.4](https://github.com/i-am-logger/claude-stats/compare/v1.4.3...v1.4.4) (2026-02-28)
 
 
