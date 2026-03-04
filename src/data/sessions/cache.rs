@@ -56,6 +56,27 @@ pub struct SessionCache {
     entries: HashMap<PathBuf, CachedEntry>,
 }
 
+/// Append ` #1`, ` #2`, … to session titles that appear more than once so
+/// the user can distinguish multiple sessions from the same project.
+fn disambiguate_titles(sessions: &mut [SessionData]) {
+    // Count occurrences of each title.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for s in sessions.iter() {
+        *counts.entry(s.title.clone()).or_insert(0) += 1;
+    }
+
+    // For duplicated titles, assign incrementing suffixes.
+    let mut next: HashMap<String, usize> = HashMap::new();
+    for s in sessions.iter_mut() {
+        if counts.get(&s.title).copied().unwrap_or(0) > 1 {
+            let base = s.title.clone();
+            let n = next.entry(base.clone()).or_insert(1);
+            s.title = format!("{base} #{n}");
+            *n += 1;
+        }
+    }
+}
+
 impl SessionCache {
     pub fn new() -> Self {
         Self {
@@ -89,8 +110,8 @@ impl SessionCache {
                 continue;
             }
 
-            let has_process =
-                process::AVAILABLE && active_dirs.contains(&project_entry.file_name());
+            let process_count = active_dirs.get(&project_entry.file_name()).copied();
+            let has_process = process::AVAILABLE && process_count.is_some();
 
             // When process detection is available, skip projects without a
             // running claude process.
@@ -102,10 +123,10 @@ impl SessionCache {
                 continue;
             };
 
-            // Track the most recently modified session file for this project.
-            // When process detection is active, only the newest file is the
-            // live session — older files are past conversations.
-            let mut newest: Option<(u64, PathBuf)> = None;
+            // Collect all JSONL candidates for this project when process
+            // detection is active; we'll keep the N most recent where N is
+            // the number of running processes.
+            let mut project_files: Vec<(u64, PathBuf)> = Vec::new();
 
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -126,18 +147,19 @@ impl SessionCache {
                     .as_secs();
 
                 if has_process {
-                    // Process alive: keep only the most recently modified file.
-                    if newest.as_ref().is_none_or(|(prev_age, _)| age < *prev_age) {
-                        newest = Some((age, path));
-                    }
+                    project_files.push((age, path));
                 } else if age < MAX_AGE_SECS {
                     // No process / non-Linux fallback: mtime filter.
                     candidates.push((age, path));
                 }
             }
 
-            if let Some(entry) = newest {
-                candidates.push(entry);
+            if has_process {
+                // Sort by age ascending (newest first) and keep at most
+                // process_count files.
+                project_files.sort_by_key(|(age, _)| *age);
+                project_files.truncate(process_count.unwrap_or(1));
+                candidates.append(&mut project_files);
             }
         }
 
@@ -150,6 +172,7 @@ impl SessionCache {
         let active: HashSet<&PathBuf> = candidates.iter().map(|(_, p)| p).collect();
         self.entries.retain(|k, _| active.contains(k));
 
+        disambiguate_titles(&mut sessions);
         sessions.sort_by(|a, b| a.title.cmp(&b.title));
         sessions
     }
@@ -962,5 +985,70 @@ mod tests {
         let tasks: HashSet<&str> = session.agents.iter().map(|a| a.task.as_str()).collect();
         assert!(tasks.contains("Active fg task"));
         assert!(tasks.contains("Lint code"));
+    }
+
+    // ── disambiguate_titles ──────────────────────────────────────
+
+    fn make_session(title: &str) -> SessionData {
+        SessionData {
+            title: title.to_string(),
+            git_branch: String::new(),
+            context_tokens: 0,
+            context_percent: 0,
+            agents: Vec::new(),
+            compactions: 0,
+            last_activity_label: String::new(),
+            state: SessionState::Idle,
+            activity: String::new(),
+        }
+    }
+
+    #[test]
+    fn disambiguate_unique_titles_unchanged() {
+        let mut sessions = vec![make_session("alpha"), make_session("beta")];
+        disambiguate_titles(&mut sessions);
+        assert_eq!(sessions[0].title, "alpha");
+        assert_eq!(sessions[1].title, "beta");
+    }
+
+    #[test]
+    fn disambiguate_duplicates_get_suffixed() {
+        let mut sessions = vec![make_session("proj"), make_session("proj")];
+        disambiguate_titles(&mut sessions);
+        assert_eq!(sessions[0].title, "proj #1");
+        assert_eq!(sessions[1].title, "proj #2");
+    }
+
+    #[test]
+    fn disambiguate_three_duplicates() {
+        let mut sessions = vec![
+            make_session("proj"),
+            make_session("proj"),
+            make_session("proj"),
+        ];
+        disambiguate_titles(&mut sessions);
+        assert_eq!(sessions[0].title, "proj #1");
+        assert_eq!(sessions[1].title, "proj #2");
+        assert_eq!(sessions[2].title, "proj #3");
+    }
+
+    #[test]
+    fn disambiguate_empty_vec() {
+        let mut sessions: Vec<SessionData> = Vec::new();
+        disambiguate_titles(&mut sessions);
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn disambiguate_mixed_unique_and_duplicates() {
+        let mut sessions = vec![
+            make_session("proj"),
+            make_session("other"),
+            make_session("proj"),
+        ];
+        disambiguate_titles(&mut sessions);
+        assert_eq!(sessions[0].title, "proj #1");
+        assert_eq!(sessions[1].title, "other");
+        assert_eq!(sessions[2].title, "proj #2");
     }
 }

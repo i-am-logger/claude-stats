@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::OsString;
 
 /// Encode an absolute path into the project directory name format used by
@@ -16,23 +16,23 @@ fn encode_cwd(path: &std::path::Path) -> OsString {
 /// back to mtime-based detection.
 pub(crate) const AVAILABLE: bool = cfg!(target_os = "linux");
 
-/// Return the set of project directory names that have a running `claude`
-/// process. On Linux this scans `/proc`; on other platforms it returns an
-/// empty set (check `AVAILABLE` to distinguish "no sessions" from
+/// Return a map of project directory names to the number of running `claude`
+/// processes in each. On Linux this scans `/proc`; on other platforms it
+/// returns an empty map (check `AVAILABLE` to distinguish "no sessions" from
 /// "detection unavailable").
-pub(crate) fn active_project_dirs() -> HashSet<OsString> {
+pub(crate) fn active_project_dirs() -> HashMap<OsString, usize> {
     #[cfg(target_os = "linux")]
     {
         scan_proc()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        HashSet::new()
+        HashMap::new()
     }
 }
 
 #[cfg(target_os = "linux")]
-fn scan_proc() -> HashSet<OsString> {
+fn scan_proc() -> HashMap<OsString, usize> {
     use std::ffi::OsStr;
     use std::fs;
     use std::path::Path;
@@ -55,7 +55,7 @@ fn scan_proc() -> HashSet<OsString> {
         }
     }
 
-    let mut dirs = HashSet::new();
+    let mut dirs = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
         return dirs;
     };
@@ -73,7 +73,7 @@ fn scan_proc() -> HashSet<OsString> {
         }
 
         if let Some(cwd) = read_cwd(&pid_dir) {
-            dirs.insert(encode_cwd(&cwd));
+            *dirs.entry(encode_cwd(&cwd)).or_insert(0) += 1;
         }
     }
 
