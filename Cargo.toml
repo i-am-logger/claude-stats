@@ -92,6 +92,7 @@ significant_drop_tightening = "allow"
 
 [dev-dependencies]
 criterion = "0.5"
+http = "1"
 proptest = "1"
 tempfile = "3"
 

@@ -219,6 +219,7 @@ dependencies = [
  "criterion",
  "crossterm 0.29.0",
  "dirs",
+ "http",
  "humantime",
  "notify",
  "proptest",

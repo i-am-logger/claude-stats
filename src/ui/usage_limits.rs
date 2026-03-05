@@ -109,16 +109,16 @@ impl Section for UsageLimitsSection<'_> {
                 .split(area);
 
             let mut i = 0;
+            let mut first_limit = true;
             for (title, limit_opt) in &limits {
                 if let Some(ref limit) = limit_opt {
-                    render_limit(
-                        title,
-                        limit,
-                        rate_limit_label.as_deref(),
-                        frame,
-                        &chunks,
-                        &mut i,
-                    );
+                    let label = if first_limit {
+                        first_limit = false;
+                        rate_limit_label.as_deref()
+                    } else {
+                        None
+                    };
+                    render_limit(title, limit, label, frame, &chunks, &mut i);
                     i += 1; // spacer
                 }
             }
@@ -162,6 +162,8 @@ fn render_limit(
         Span::styled(title, Style::default()),
         Span::styled(format!(" ({percent}%)"), Style::default().fg(color)),
     ];
+    // Show rate limit only on the first limit title to avoid repetition.
+    // The caller passes `None` for subsequent limits.
     if let Some(label) = rate_limit_label {
         spans.push(Span::styled(
             format!(" — rate limited, retrying in {label}"),

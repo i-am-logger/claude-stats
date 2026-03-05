@@ -325,6 +325,28 @@ mod tests {
     }
 
     #[test]
+    fn handle_rate_limit_preserves_existing_usage() {
+        let mut state = State::default();
+        // First, load some usage data
+        state.handle(AppEvent::UsageUpdated {
+            data: Ok(dummy_usage()),
+            elapsed: Duration::from_millis(100),
+        });
+        assert!(state.usage.is_some());
+
+        // Then get rate limited
+        let retry_at = chrono::Utc::now() + chrono::TimeDelta::seconds(300);
+        state.handle(AppEvent::UsageUpdated {
+            data: Err(FetchError::RateLimited { retry_at }),
+            elapsed: Duration::ZERO,
+        });
+        // Usage data should be preserved, error should be set
+        assert!(state.usage.is_some());
+        assert!(state.error.is_some());
+        assert!(matches!(state.error, Some(FetchError::RateLimited { .. })));
+    }
+
+    #[test]
     fn handle_usage_updated_slow() {
         let mut state = State::default();
         let shutdown = state.handle(AppEvent::UsageUpdated {

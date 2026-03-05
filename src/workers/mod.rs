@@ -138,6 +138,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backoff_rate_limit_overrides_interval() {
+        let mut b = Backoff::new(Duration::from_secs(30), Duration::from_secs(60), 3);
+        let retry_at = chrono::Utc::now() + chrono::TimeDelta::seconds(120);
+        b.record_rate_limit(retry_at);
+        let interval = b.interval();
+        // Should be close to 120s, not the normal 30s
+        assert!(interval > Duration::from_secs(118), "got {interval:?}");
+        assert!(interval <= Duration::from_secs(120), "got {interval:?}");
+    }
+
+    #[tokio::test]
+    async fn backoff_rate_limit_clears_on_success() {
+        let mut b = Backoff::new(Duration::from_secs(30), Duration::from_secs(60), 3);
+        let retry_at = chrono::Utc::now() + chrono::TimeDelta::seconds(300);
+        b.record_rate_limit(retry_at);
+        assert!(b.interval() > Duration::from_secs(60));
+        b.record(false);
+        assert_eq!(b.interval(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn backoff_expired_rate_limit_falls_through() {
+        let mut b = Backoff::new(Duration::from_secs(30), Duration::from_secs(60), 3);
+        let retry_at = chrono::Utc::now() - chrono::TimeDelta::seconds(10);
+        b.record_rate_limit(retry_at);
+        // Expired rate limit, but 1 consecutive error (below threshold of 3)
+        assert_eq!(b.interval(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
     async fn resource_guard_sends_busy_and_idle() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         {

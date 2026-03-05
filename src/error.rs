@@ -107,3 +107,126 @@ pub enum CredentialError {
     #[error("missing OAuth access token in credentials")]
     MissingToken,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── rate_limit_remaining_secs ─────────────────────────────
+
+    #[test]
+    fn remaining_secs_future_retry_at() {
+        let retry_at = Utc::now() + chrono::TimeDelta::seconds(120);
+        let err = FetchError::RateLimited { retry_at };
+        let secs = err.rate_limit_remaining_secs().unwrap();
+        // Allow 1s tolerance for test execution time
+        assert!(secs >= 119 && secs <= 120, "got {secs}");
+    }
+
+    #[test]
+    fn remaining_secs_past_retry_at_clamped_to_zero() {
+        let retry_at = Utc::now() - chrono::TimeDelta::seconds(60);
+        let err = FetchError::RateLimited { retry_at };
+        assert_eq!(err.rate_limit_remaining_secs(), Some(0));
+    }
+
+    #[test]
+    fn remaining_secs_none_for_non_rate_limit() {
+        assert_eq!(FetchError::Timeout.rate_limit_remaining_secs(), None);
+    }
+
+    // ── rate_limit_label ──────────────────────────────────────
+
+    #[test]
+    fn label_future_retry_at() {
+        let retry_at = Utc::now() + chrono::TimeDelta::seconds(300);
+        let err = FetchError::RateLimited { retry_at };
+        let label = err.rate_limit_label().unwrap();
+        assert!(label.contains('m'), "expected minutes in '{label}'");
+    }
+
+    #[test]
+    fn label_expired_retry_at_is_now() {
+        let retry_at = Utc::now() - chrono::TimeDelta::seconds(10);
+        let err = FetchError::RateLimited { retry_at };
+        assert_eq!(err.rate_limit_label(), Some("now".to_string()));
+    }
+
+    #[test]
+    fn label_none_for_non_rate_limit() {
+        assert_eq!(FetchError::Timeout.rate_limit_label(), None);
+    }
+
+    // ── check_response (429) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn check_response_429_with_retry_after() {
+        let resp = http::Response::builder()
+            .status(429)
+            .header("retry-after", "120")
+            .body("")
+            .unwrap();
+        let resp = reqwest::Response::from(resp);
+        let err = check_response(resp).await.unwrap_err();
+        match err {
+            FetchError::RateLimited { retry_at } => {
+                let secs = retry_at.signed_duration_since(Utc::now()).num_seconds();
+                assert!(secs >= 119 && secs <= 120, "got {secs}");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_response_429_without_header_uses_default() {
+        let resp = http::Response::builder().status(429).body("").unwrap();
+        let resp = reqwest::Response::from(resp);
+        let err = check_response(resp).await.unwrap_err();
+        match err {
+            FetchError::RateLimited { retry_at } => {
+                let secs = retry_at.signed_duration_since(Utc::now()).num_seconds();
+                assert!(secs >= 299 && secs <= 300, "got {secs}");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_response_429_with_zero_retry_after_uses_default() {
+        let resp = http::Response::builder()
+            .status(429)
+            .header("retry-after", "0")
+            .body("")
+            .unwrap();
+        let resp = reqwest::Response::from(resp);
+        let err = check_response(resp).await.unwrap_err();
+        match err {
+            FetchError::RateLimited { retry_at } => {
+                let secs = retry_at.signed_duration_since(Utc::now()).num_seconds();
+                assert!(secs >= 299 && secs <= 300, "got {secs}");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_response_success_passes_through() {
+        let resp = http::Response::builder().status(200).body("").unwrap();
+        let resp = reqwest::Response::from(resp);
+        assert!(check_response(resp).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_response_500_returns_api_error() {
+        let resp = http::Response::builder().status(500).body("oops").unwrap();
+        let resp = reqwest::Response::from(resp);
+        let err = check_response(resp).await.unwrap_err();
+        match err {
+            FetchError::Api { status, body } => {
+                assert_eq!(status, 500);
+                assert_eq!(body, "oops");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+}
