@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.0](https://github.com/i-am-logger/claude-stats/compare/v1.4.5...v1.5.0) (2026-03-05)
+
+
+### Features
+
+* handle HTTP 429 rate limiting with countdown timer ([dadeb42](https://github.com/i-am-logger/claude-stats/commit/dadeb4245ecbab6b1dfae9c6878909853f9aedc1))
+
+
+### Bug Fixes
+
+* increase poll interval to 6 minutes, add rate limiting tests ([c339c11](https://github.com/i-am-logger/claude-stats/commit/c339c1105fa23b3d696a9e1145e7391469127202))
+* increase usage and status poll intervals from 30s to 60s ([58141c0](https://github.com/i-am-logger/claude-stats/commit/58141c0188c607e7b4a248e62994cf975bb48dba))
+* show "rate limited" in red on title lines, poll every 2 minutes ([fd102c4](https://github.com/i-am-logger/claude-stats/commit/fd102c4369d1054b5d8278aabbc42018f9dc0a59))
+
 ## [1.4.5](https://github.com/i-am-logger/claude-stats/compare/v1.4.4...v1.4.5) (2026-03-04)
 
 
