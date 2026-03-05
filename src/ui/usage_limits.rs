@@ -15,7 +15,7 @@ use ratatui::{
 /// colour changes from red to yellow to indicate the reset is imminent.
 const RESET_SOON_SECS: i64 = 1800;
 
-fn usage_height(usage: Option<&UsageData>) -> u16 {
+fn usage_height(usage: Option<&UsageData>, rate_limited: bool) -> u16 {
     if let Some(data) = usage {
         let mut h = 0u16;
         if data.five_hour.is_some() {
@@ -31,6 +31,9 @@ fn usage_height(usage: Option<&UsageData>) -> u16 {
             h += 4;
         }
         h
+    } else if rate_limited {
+        // title + countdown line
+        2
     } else {
         1
     }
@@ -68,10 +71,16 @@ pub(super) struct UsageLimitsSection<'a> {
 
 impl Section for UsageLimitsSection<'_> {
     fn height(&self, _width: u16) -> u16 {
-        usage_height(self.usage.as_ref())
+        let rate_limited = self
+            .error
+            .as_ref()
+            .is_some_and(|e| matches!(e, FetchError::RateLimited { .. }));
+        usage_height(self.usage.as_ref(), rate_limited)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        let rate_limit_label = self.error.as_ref().and_then(FetchError::rate_limit_label);
+
         if let Some(ref data) = self.usage {
             let limits: Vec<(&str, &Option<UsageLimit>)> = vec![
                 ("◔ Current session", &data.five_hour),
@@ -102,9 +111,33 @@ impl Section for UsageLimitsSection<'_> {
             let mut i = 0;
             for (title, limit_opt) in &limits {
                 if let Some(ref limit) = limit_opt {
-                    render_limit(title, limit, frame, &chunks, &mut i);
+                    render_limit(
+                        title,
+                        limit,
+                        rate_limit_label.as_deref(),
+                        frame,
+                        &chunks,
+                        &mut i,
+                    );
                     i += 1; // spacer
                 }
+            }
+        } else if let Some(label) = &rate_limit_label {
+            // No data yet but rate limited — show title with countdown
+            let constraints = vec![Constraint::Length(1), Constraint::Length(1)];
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(&constraints)
+                .split(area);
+            let title = Paragraph::new(Line::from(vec![
+                Span::styled("◔ Current session", Style::default()),
+                Span::styled(
+                    format!(" — retrying in {label}"),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+            if let Some(&area) = chunks.first() {
+                frame.render_widget(title, padded(area));
             }
         } else {
             let (msg, color) = no_data_message(self.fetching, self.error.as_ref());
@@ -117,6 +150,7 @@ impl Section for UsageLimitsSection<'_> {
 fn render_limit(
     title: &str,
     limit: &UsageLimit,
+    rate_limit_label: Option<&str>,
     frame: &mut Frame<'_>,
     chunks: &[Rect],
     i: &mut usize,
@@ -124,10 +158,17 @@ fn render_limit(
     let percent = limit.percent();
     let color = percent_color(percent);
 
-    let title_w = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(title, Style::default()),
         Span::styled(format!(" ({percent}%)"), Style::default().fg(color)),
-    ]));
+    ];
+    if let Some(label) = rate_limit_label {
+        spans.push(Span::styled(
+            format!(" — retrying in {label}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let title_w = Paragraph::new(Line::from(spans));
     let Some(&area) = chunks.get(*i) else { return };
     frame.render_widget(title_w, padded(area));
     *i += 1;
@@ -157,7 +198,12 @@ mod tests {
 
     #[test]
     fn usage_height_no_data() {
-        assert_eq!(usage_height(None), 1);
+        assert_eq!(usage_height(None, false), 1);
+    }
+
+    #[test]
+    fn usage_height_no_data_rate_limited() {
+        assert_eq!(usage_height(None, true), 2);
     }
 
     #[test]
@@ -168,7 +214,7 @@ mod tests {
             seven_day_opus: None,
             seven_day_sonnet: None,
         };
-        assert_eq!(usage_height(Some(&data)), 0);
+        assert_eq!(usage_height(Some(&data), false), 0);
     }
 
     #[test]
@@ -182,7 +228,7 @@ mod tests {
             seven_day_opus: None,
             seven_day_sonnet: None,
         };
-        assert_eq!(usage_height(Some(&data)), 4);
+        assert_eq!(usage_height(Some(&data), false), 4);
     }
 
     #[test]
@@ -199,7 +245,7 @@ mod tests {
             seven_day_opus: limit(),
             seven_day_sonnet: limit(),
         };
-        assert_eq!(usage_height(Some(&data)), 16);
+        assert_eq!(usage_height(Some(&data), false), 16);
     }
 
     // ── timer_color ──────────────────────────────────────────

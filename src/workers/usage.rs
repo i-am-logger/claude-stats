@@ -12,6 +12,10 @@ struct AccountState {
     plan: Option<Plan>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "sequential async steps in a single worker loop"
+)]
 pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = Backoff::new(Duration::from_secs(60), Duration::from_secs(120), 3);
@@ -75,7 +79,11 @@ pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHa
                     if let Err(ref e) = result {
                         tracing::warn!("usage fetch error: {e}");
                     }
-                    backoff.record(result.is_err());
+                    if let Err(FetchError::RateLimited { retry_at }) = &result {
+                        backoff.record_rate_limit(*retry_at);
+                    } else {
+                        backoff.record(result.is_err());
+                    }
 
                     if tx
                         .send(AppEvent::UsageUpdated {

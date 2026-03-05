@@ -42,16 +42,27 @@ pub(crate) struct Backoff {
     normal: Duration,
     elevated: Duration,
     threshold: u32,
+    rate_limit_until: Option<tokio::time::Instant>,
 }
 
 impl Backoff {
-    pub(crate) const fn new(normal: Duration, elevated: Duration, threshold: u32) -> Self {
+    pub(crate) fn new(normal: Duration, elevated: Duration, threshold: u32) -> Self {
         Self {
             consecutive_errors: 0,
             normal,
             elevated,
             threshold,
+            rate_limit_until: None,
         }
+    }
+
+    pub(crate) fn record_rate_limit(&mut self, retry_at: chrono::DateTime<chrono::Utc>) {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        let delay_secs = retry_at
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds()
+            .max(0) as u64;
+        self.rate_limit_until = Some(tokio::time::Instant::now() + Duration::from_secs(delay_secs));
     }
 
     pub(crate) fn record(&mut self, is_err: bool) {
@@ -59,10 +70,17 @@ impl Backoff {
             self.consecutive_errors = self.consecutive_errors.saturating_add(1);
         } else {
             self.consecutive_errors = 0;
+            self.rate_limit_until = None;
         }
     }
 
-    pub(crate) const fn interval(&self) -> Duration {
+    pub(crate) fn interval(&self) -> Duration {
+        if let Some(until) = self.rate_limit_until {
+            let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining > Duration::ZERO {
+                return remaining;
+            }
+        }
         if self.consecutive_errors >= self.threshold {
             self.elevated
         } else {

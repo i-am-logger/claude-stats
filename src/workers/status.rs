@@ -15,7 +15,12 @@ pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHa
             if let Err(ref e) = result {
                 tracing::warn!("status fetch error: {e}");
             }
-            backoff.record(result.is_err());
+            if let Err(crate::error::FetchError::RateLimited { retry_at }) = &result {
+                backoff.record_rate_limit(*retry_at);
+            } else {
+                backoff.record(result.is_err());
+            }
+
             if tx.send(AppEvent::StatusUpdated(result)).await.is_err() {
                 break;
             }
