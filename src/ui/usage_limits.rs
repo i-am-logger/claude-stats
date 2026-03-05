@@ -132,8 +132,8 @@ impl Section for UsageLimitsSection<'_> {
             let title = Paragraph::new(Line::from(vec![
                 Span::styled("◔ Current session", Style::default()),
                 Span::styled(
-                    format!(" — retrying in {label}"),
-                    Style::default().fg(Color::Yellow),
+                    format!(" — rate limited, retrying in {label}"),
+                    Style::default().fg(Color::Red),
                 ),
             ]));
             if let Some(&area) = chunks.first() {
@@ -164,8 +164,8 @@ fn render_limit(
     ];
     if let Some(label) = rate_limit_label {
         spans.push(Span::styled(
-            format!(" — retrying in {label}"),
-            Style::default().fg(Color::Yellow),
+            format!(" — rate limited, retrying in {label}"),
+            Style::default().fg(Color::Red),
         ));
     }
     let title_w = Paragraph::new(Line::from(spans));
