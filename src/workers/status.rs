@@ -5,7 +5,7 @@ use std::time::Duration;
 
 pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut backoff = Backoff::new(Duration::from_secs(30), Duration::from_secs(60), 3);
+        let mut backoff = Backoff::new(Duration::from_secs(60), Duration::from_secs(120), 3);
 
         loop {
             let result = {
