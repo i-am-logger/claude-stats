@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.1](https://github.com/i-am-logger/claude-stats/compare/v1.5.0...v1.5.1) (2026-03-06)
+
+
+### Bug Fixes
+
+* show "No active contexts" when no sessions are found ([7983aaf](https://github.com/i-am-logger/claude-stats/commit/7983aaf988e107913f8e836e13655423b8c58470))
+
 ## [1.5.0](https://github.com/i-am-logger/claude-stats/compare/v1.4.5...v1.5.0) (2026-03-05)
 
 
