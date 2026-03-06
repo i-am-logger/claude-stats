@@ -12,7 +12,7 @@ use ratatui::{
 
 fn contexts_height(sessions: &[SessionData]) -> u16 {
     if sessions.is_empty() {
-        return 0;
+        return 3; // header + blank + "no active contexts"
     }
     let mut h: u16 = 2; // header + blank
     for session in sessions {
@@ -87,6 +87,26 @@ impl Section for ContextsSection<'_> {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         if self.sessions.is_empty() {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // header
+                    Constraint::Length(1), // blank
+                    Constraint::Length(1), // message
+                ])
+                .split(area);
+
+            let header = Paragraph::new(Line::from(Span::styled(
+                "⊙ Active contexts (0)",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            frame.render_widget(header, padded(chunks[0]));
+
+            let msg = Paragraph::new(Line::from(Span::styled(
+                "No active contexts",
+                Style::default().fg(DIM),
+            )));
+            frame.render_widget(msg, indented(chunks[2]));
             return;
         }
 
@@ -272,7 +292,7 @@ mod tests {
 
     #[test]
     fn contexts_height_empty() {
-        assert_eq!(contexts_height(&[]), 0);
+        assert_eq!(contexts_height(&[]), 3);
     }
 
     #[test]
