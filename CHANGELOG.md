@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.2](https://github.com/i-am-logger/claude-stats/compare/v1.5.1...v1.5.2) (2026-03-08)
+
+
+### Bug Fixes
+
+* improve rate limiting with HTTP-date parsing and longer intervals ([4bd6c2d](https://github.com/i-am-logger/claude-stats/commit/4bd6c2d880b9799e2784e2a1dfc54ee4c830ba8e))
+
 ## [1.5.1](https://github.com/i-am-logger/claude-stats/compare/v1.5.0...v1.5.1) (2026-03-06)
 
 
