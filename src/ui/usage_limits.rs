@@ -51,6 +51,9 @@ fn timer_color(percent: u16, remaining_secs: i64) -> Color {
     }
 }
 
+/// Message shown when no usage data has been loaded yet.
+/// Note: `RateLimited` errors are handled by a separate render path and
+/// never reach this function.
 fn no_data_message(fetching: bool, error: Option<&FetchError>) -> (String, Color) {
     if fetching {
         ("Loading usage data...".to_string(), DIM)
@@ -248,6 +251,24 @@ mod tests {
             seven_day_sonnet: limit(),
         };
         assert_eq!(usage_height(Some(&data), false), 16);
+    }
+
+    #[test]
+    fn usage_height_with_data_rate_limited_unchanged() {
+        // Rate limit countdown is inline on the title, not an extra line
+        let data = UsageData {
+            five_hour: Some(UsageLimit {
+                utilization: Some(50.0),
+                resets_at: None,
+            }),
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+        };
+        assert_eq!(
+            usage_height(Some(&data), true),
+            usage_height(Some(&data), false)
+        );
     }
 
     // ── timer_color ──────────────────────────────────────────

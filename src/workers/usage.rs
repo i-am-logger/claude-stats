@@ -18,7 +18,7 @@ struct AccountState {
 )]
 pub(crate) fn spawn(tx: EventTx, client: reqwest::Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut backoff = Backoff::new(Duration::from_secs(360), Duration::from_secs(300), 3);
+        let mut backoff = Backoff::new(Duration::from_secs(600), Duration::from_secs(900), 3);
         let mut cached_token: Option<String> = None;
         let mut prev_account = AccountState::default();
 

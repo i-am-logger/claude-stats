@@ -40,7 +40,7 @@ impl From<reqwest::Error> for FetchError {
 }
 
 /// Default retry delay (seconds) when a 429 response lacks a valid `Retry-After` header.
-const DEFAULT_RETRY_SECS: i64 = 300;
+const DEFAULT_RETRY_SECS: i64 = 900;
 
 impl FetchError {
     /// Seconds remaining until rate limit expires, or `None` for non-rate-limit errors.
@@ -68,6 +68,23 @@ impl FetchError {
     }
 }
 
+/// Parse a `Retry-After` header value as either seconds or an HTTP-date (RFC 7231).
+/// Returns `None` if the value is unparseable or zero seconds.
+fn parse_retry_after(value: &str) -> Option<DateTime<Utc>> {
+    // Try as seconds first (most common)
+    if let Ok(secs) = value.parse::<i64>() {
+        if secs > 0 {
+            return Some(Utc::now() + chrono::TimeDelta::seconds(secs));
+        }
+        return None;
+    }
+    // Try as HTTP-date (IMF-fixdate): "Thu, 05 Mar 2026 06:40:00 GMT"
+    chrono::NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()
+        .map(|naive| naive.and_utc())
+        .filter(|dt| *dt > Utc::now())
+}
+
 /// Check an HTTP response status and return the response on success, or a
 /// `FetchError::Api` with the status code and body text on failure.
 pub async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response, FetchError> {
@@ -75,14 +92,12 @@ pub async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response
         return Ok(resp);
     }
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let delay_secs = resp
+        let retry_at = resp
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<i64>().ok())
-            .filter(|&secs| secs > 0)
-            .unwrap_or(DEFAULT_RETRY_SECS);
-        let retry_at = Utc::now() + chrono::TimeDelta::seconds(delay_secs);
+            .and_then(parse_retry_after)
+            .unwrap_or_else(|| Utc::now() + chrono::TimeDelta::seconds(DEFAULT_RETRY_SECS));
         return Err(FetchError::RateLimited { retry_at });
     }
     let status = resp.status().as_u16();
@@ -159,6 +174,44 @@ mod tests {
 
     // ── check_response (429) ──────────────────────────────────
 
+    // ── parse_retry_after ───────────────────────────────────────
+
+    #[test]
+    fn parse_retry_after_seconds() {
+        let dt = parse_retry_after("120").unwrap();
+        let secs = dt.signed_duration_since(Utc::now()).num_seconds();
+        assert!(secs >= 119 && secs <= 120, "got {secs}");
+    }
+
+    #[test]
+    fn parse_retry_after_zero_returns_none() {
+        assert!(parse_retry_after("0").is_none());
+    }
+
+    #[test]
+    fn parse_retry_after_negative_returns_none() {
+        assert!(parse_retry_after("-10").is_none());
+    }
+
+    #[test]
+    fn parse_retry_after_http_date() {
+        // Use a date far in the future so it's always valid
+        let dt = parse_retry_after("Thu, 01 Jan 2099 00:00:00 GMT").unwrap();
+        assert!(dt > Utc::now());
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_in_past_returns_none() {
+        assert!(parse_retry_after("Thu, 01 Jan 2020 00:00:00 GMT").is_none());
+    }
+
+    #[test]
+    fn parse_retry_after_garbage_returns_none() {
+        assert!(parse_retry_after("not-a-date").is_none());
+    }
+
+    // ── check_response (429) ──────────────────────────────────
+
     #[tokio::test]
     async fn check_response_429_with_retry_after() {
         let resp = http::Response::builder()
@@ -185,7 +238,7 @@ mod tests {
         match err {
             FetchError::RateLimited { retry_at } => {
                 let secs = retry_at.signed_duration_since(Utc::now()).num_seconds();
-                assert!(secs >= 299 && secs <= 300, "got {secs}");
+                assert!(secs >= 899 && secs <= 900, "got {secs}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
@@ -203,7 +256,7 @@ mod tests {
         match err {
             FetchError::RateLimited { retry_at } => {
                 let secs = retry_at.signed_duration_since(Utc::now()).num_seconds();
-                assert!(secs >= 299 && secs <= 300, "got {secs}");
+                assert!(secs >= 899 && secs <= 900, "got {secs}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
