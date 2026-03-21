@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.4](https://github.com/i-am-logger/claude-stats/compare/v1.5.3...v1.5.4) (2026-03-21)
+
+
+### Bug Fixes
+
+* update quinn-proto and rustls-webpki for security advisories ([197f623](https://github.com/i-am-logger/claude-stats/commit/197f623ef2a6d30dec86ef1bf8b4603a5fcedee6))
+
 ## [1.5.3](https://github.com/i-am-logger/claude-stats/compare/v1.5.2...v1.5.3) (2026-03-21)
 
 
