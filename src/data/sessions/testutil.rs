@@ -15,7 +15,7 @@ pub(crate) fn jsonl_file(lines: &[&str]) -> tempfile::NamedTempFile {
 
 pub(crate) fn assistant_usage_line(input_tokens: u64) -> String {
     format!(
-        r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":{input_tokens}}},"content":[{{"type":"text","text":"ok"}}],"stop_reason":"end_turn"}}}}"#
+        r#"{{"type":"assistant","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":{input_tokens}}},"content":[{{"type":"text","text":"ok"}}],"stop_reason":"end_turn"}}}}"#
     )
 }
 

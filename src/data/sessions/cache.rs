@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use super::{activity, process, subagents, tail, SessionData, SessionState, CONTEXT_WINDOW};
+use super::{activity, process, subagents, tail, SessionData};
 
 /// Sessions modified more than 60s ago are considered inactive and excluded
 /// from the dashboard.
@@ -22,6 +22,7 @@ struct CachedEntry {
     last_lines: VecDeque<String>,
     bytes_read: u64,
     tracker: tail::AgentTracker,
+    model: String,
 }
 
 impl CachedEntry {
@@ -34,6 +35,7 @@ impl CachedEntry {
             last_lines: data.last_lines,
             bytes_read: file_len,
             tracker: data.tracker,
+            model: data.model,
         }
     }
 }
@@ -47,6 +49,7 @@ struct SessionFileResult {
     last_tokens: u64,
     compactions: u32,
     last_lines: VecDeque<String>,
+    model: String,
 }
 
 /// Caches session file state across polls. First encounter does a full read;
@@ -198,6 +201,7 @@ impl SessionCache {
             last_tokens: cached.last_tokens,
             compactions: cached.compactions,
             last_lines: cached.last_lines.clone(),
+            model: cached.model.clone(),
         }
     }
 
@@ -227,6 +231,9 @@ impl SessionCache {
                     }
                     cached.bytes_read = file_len;
                     cached.tracker.merge(&result.tracker);
+                    if !result.model.is_empty() {
+                        cached.model = result.model;
+                    }
                     Some(Self::result_from_cache(cached))
                 }
                 std::cmp::Ordering::Equal => Some(Self::result_from_cache(cached)),
@@ -251,18 +258,15 @@ impl SessionCache {
 
         let (session_state, act) = activity::detect_state_and_activity(&sfr.last_lines);
 
-        // Only scan subagents when the parent session is actively working.
-        // Determine which agents are truly active by checking the parent
-        // JSONL for tool_result completion entries — purely deterministic.
+        // Always check for active subagents — background agents keep running
+        // even after the parent conversation turn finishes (Idle state).
         let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
-        let agents = if session_state == SessionState::Working {
-            let active_ids = self.update_agent_tracking(path);
-            subagents::scan_subagents(&subagents_dir, &active_ids)
-        } else {
-            Vec::new()
-        };
-        let context_percent = ((sfr.last_tokens.min(CONTEXT_WINDOW) * 100) / CONTEXT_WINDOW) as u16;
+        let active_ids = self.update_agent_tracking(path);
+        let agents = subagents::scan_subagents(&subagents_dir, &active_ids);
+
+        let context_window = tail::context_window_for_model(&sfr.model);
+        let context_percent = ((sfr.last_tokens.min(context_window) * 100) / context_window) as u16;
 
         let last_activity_label = format!(
             "{} ago",
@@ -273,6 +277,7 @@ impl SessionCache {
             title,
             git_branch: sfr.git_branch,
             context_tokens: sfr.last_tokens,
+            context_window,
             context_percent,
             agents,
             compactions: sfr.compactions,
@@ -300,6 +305,7 @@ mod tests {
         assistant_usage_line, async_agent_launch_line, jsonl_file, progress_line,
         queue_operation_complete_line, tool_result_line, write_agent_file,
     };
+    use crate::data::sessions::SessionState;
     use std::io::{Seek, SeekFrom, Write};
 
     // ── scan_session_file (full read) ─────────────────────────────
@@ -498,7 +504,8 @@ mod tests {
         assert_eq!(session.title, "my-project");
         assert_eq!(session.git_branch, "feat");
         assert_eq!(session.context_tokens, 50_000);
-        assert_eq!(session.context_percent, 30); // 50000/166000 ≈ 30%
+        assert_eq!(session.context_percent, 5); // 50000/1000000 = 5%
+        assert_eq!(session.context_window, 1_000_000);
         assert_eq!(session.compactions, 0);
         assert_eq!(session.state, SessionState::Idle);
         assert!(session.last_activity_label.contains("ago"));
@@ -994,6 +1001,7 @@ mod tests {
             title: title.to_string(),
             git_branch: String::new(),
             context_tokens: 0,
+            context_window: 200_000,
             context_percent: 0,
             agents: Vec::new(),
             compactions: 0,

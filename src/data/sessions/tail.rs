@@ -7,10 +7,25 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
-/// Claude's context window size in tokens. Used to compute context utilisation
-/// percentage. Must be non-zero to avoid division-by-zero in `parse_session`.
-pub const CONTEXT_WINDOW: u64 = 166_000;
-const _: () = assert!(CONTEXT_WINDOW > 0);
+/// Default context window size for models we don't recognise.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+
+/// Return the context window size for a model based on its API identifier.
+///
+/// Claude 4.6 (Opus & Sonnet) and Sonnet 4.5 / Sonnet 4 expose a 1 M-token
+/// context window. Older Opus models and Haiku use 200 k.
+pub fn context_window_for_model(model: &str) -> u64 {
+    // 4.6 generation — always 1M
+    if model.contains("opus-4-6") || model.contains("sonnet-4-6") {
+        return 1_000_000;
+    }
+    // Sonnet 4.5 and Sonnet 4 support 1M (Claude Code enables the beta header)
+    if model.contains("sonnet-4-5") || model.contains("sonnet-4-2") {
+        return 1_000_000;
+    }
+    // Haiku 4.5, older Opus, and anything unknown → 200k
+    DEFAULT_CONTEXT_WINDOW
+}
 
 /// Number of recent lines to retain for state detection.
 pub(crate) const RECENT_LINES: usize = 5;
@@ -152,6 +167,9 @@ pub struct SessionFileData {
     pub last_tokens: u64,
     pub compactions: u32,
     pub last_lines: VecDeque<String>,
+    /// Raw model identifier from the most recent assistant message (e.g.
+    /// `"claude-opus-4-6"`). Empty if no assistant message was seen.
+    pub model: String,
     pub(crate) tracker: AgentTracker,
 }
 
@@ -188,6 +206,7 @@ struct ScanState {
     compactions: u32,
     recent: VecDeque<String>,
     tracker: AgentTracker,
+    model: String,
 }
 
 impl ScanState {
@@ -197,6 +216,7 @@ impl ScanState {
             compactions: 0,
             recent: VecDeque::new(),
             tracker: AgentTracker::new(),
+            model: String::new(),
         }
     }
 
@@ -229,6 +249,14 @@ impl ScanState {
                     self.last_tokens = total;
                 }
             }
+            if let Some(m) = val
+                .pointer("/message/model")
+                .and_then(serde_json::Value::as_str)
+            {
+                if !m.is_empty() {
+                    self.model = m.to_string();
+                }
+            }
         }
 
         self.tracker.process(val);
@@ -240,6 +268,7 @@ impl ScanState {
             compactions: self.compactions,
             last_lines: self.recent,
             tracker: self.tracker,
+            model: self.model,
         }
     }
 }
@@ -290,6 +319,7 @@ pub fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
         last_tokens: result.last_tokens,
         compactions: result.compactions,
         last_lines: result.last_lines,
+        model: result.model,
         tracker: result.tracker,
     })
 }
@@ -301,6 +331,7 @@ pub struct ScanResult {
     pub compactions: u32,
     pub last_lines: VecDeque<String>,
     pub(crate) tracker: AgentTracker,
+    pub model: String,
 }
 
 /// Scan a session file from `offset` to EOF. Tracks token usage, compaction
@@ -378,6 +409,62 @@ pub fn read_last_lines(file: &fs::File, file_len: u64, count: usize) -> VecDeque
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── context_window_for_model ──────────────────────────────────
+
+    #[test]
+    fn context_window_opus_4_6() {
+        assert_eq!(context_window_for_model("claude-opus-4-6"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_sonnet_4_6() {
+        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_sonnet_4_5() {
+        assert_eq!(
+            context_window_for_model("claude-sonnet-4-5-20250929"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn context_window_sonnet_4() {
+        assert_eq!(
+            context_window_for_model("claude-sonnet-4-20250514"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn context_window_haiku() {
+        assert_eq!(
+            context_window_for_model("claude-haiku-4-5-20251001"),
+            DEFAULT_CONTEXT_WINDOW
+        );
+    }
+
+    #[test]
+    fn context_window_opus_4() {
+        assert_eq!(
+            context_window_for_model("claude-opus-4-20250514"),
+            DEFAULT_CONTEXT_WINDOW
+        );
+    }
+
+    #[test]
+    fn context_window_unknown() {
+        assert_eq!(context_window_for_model("gpt-4o"), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn context_window_empty() {
+        assert_eq!(context_window_for_model(""), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    // ── extract_tokens ────────────────────────────────────────────
 
     #[test]
     fn extract_tokens_all_fields() {

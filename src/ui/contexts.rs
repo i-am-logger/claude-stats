@@ -1,4 +1,4 @@
-use crate::data::sessions::{SessionData, SessionState, SubagentData, CONTEXT_WINDOW};
+use crate::data::sessions::{SessionData, SessionState, SubagentData};
 use crate::ui::common::{indented, padded, percent_color, render_bar, Section, DIM, SPINNER};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -42,7 +42,11 @@ fn format_tokens_k(tokens: u64) -> String {
 }
 
 fn format_limit_k(limit: u64) -> String {
-    format!("{:.0}k", limit as f64 / 1000.0)
+    if limit >= 1_000_000 && limit.is_multiple_of(1_000_000) {
+        format!("{}M", limit / 1_000_000)
+    } else {
+        format!("{:.0}k", limit as f64 / 1000.0)
+    }
 }
 
 fn format_agent_tokens_k(tokens: u64) -> String {
@@ -160,7 +164,7 @@ fn render_title_row(session: &SessionData, tick: u64, frame: &mut Frame<'_>, are
     let bar_color = percent_color(session.context_percent);
     let percent = session.context_percent;
     let tokens_k = format_tokens_k(session.context_tokens);
-    let limit_k = format_limit_k(CONTEXT_WINDOW);
+    let limit_k = format_limit_k(session.context_window);
 
     let (indicator, indicator_color) = session_indicator(session.state, tick);
 
@@ -272,6 +276,7 @@ mod tests {
             title: "test".into(),
             git_branch: "main".into(),
             context_tokens: 50_000,
+            context_window: 200_000,
             context_percent: 30,
             agents: (0..agents)
                 .map(|_| SubagentData {
@@ -367,8 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn format_limit_k_context_window() {
-        assert_eq!(format_limit_k(CONTEXT_WINDOW), "166k");
+    fn format_limit_k_1m() {
+        assert_eq!(format_limit_k(1_000_000), "1M");
+    }
+
+    #[test]
+    fn format_limit_k_200k() {
+        assert_eq!(format_limit_k(200_000), "200k");
     }
 
     #[test]

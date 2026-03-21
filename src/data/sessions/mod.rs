@@ -12,7 +12,6 @@ pub mod tail;
 mod testutil;
 
 pub use cache::SessionCache;
-pub use tail::CONTEXT_WINDOW;
 
 /// How many bytes from the end of a session file to read when extracting
 /// recent lines (64 KB). Used by `read_last_lines` and subagent scanning.
@@ -60,6 +59,7 @@ pub struct SessionData {
     pub title: String,
     pub git_branch: String,
     pub context_tokens: u64,
+    pub context_window: u64,
     pub context_percent: u16,
     pub agents: Vec<SubagentData>,
     pub compactions: u32,
