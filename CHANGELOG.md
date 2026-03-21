@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.3](https://github.com/i-am-logger/claude-stats/compare/v1.5.2...v1.5.3) (2026-03-21)
+
+
+### Bug Fixes
+
+* model-aware context window and persistent subagent display ([734426c](https://github.com/i-am-logger/claude-stats/commit/734426c5982ad219a39c69485075f1ba5ab85303))
+
 ## [1.5.2](https://github.com/i-am-logger/claude-stats/compare/v1.5.1...v1.5.2) (2026-03-08)
 
 
