@@ -14,12 +14,14 @@ in
   devenv.root = lib.mkDefault (builtins.toString ./.);
 
   dotenv.enable = true;
+  imports = [
+    ./nix/rust.nix
+  ];
 
   # Additional packages for development
   packages = [
     pkgs.git
     pkgs.pkg-config
-    pkgs.nixpkgs-fmt
     pkgs.cargo-watch
     pkgs.cargo-llvm-cov
     pkgs.cargo-deny
@@ -99,26 +101,34 @@ in
     echo ""
   '';
 
-  # https://devenv.sh/languages/
-  languages.rust = {
+  # https://devenv.sh/integrations/treefmt/
+  treefmt = {
     enable = true;
-    channel = "stable";
-
-    components = [
-      "rustc"
-      "cargo"
-      "clippy"
-      "rustfmt"
-      "rust-analyzer"
-      "llvm-tools-preview"
-    ];
+    config = {
+      settings.global.excludes = [
+        ".devenv.flake.nix"
+        ".devenv/"
+      ];
+      programs = {
+        nixpkgs-fmt.enable = true;
+        deadnix = {
+          enable = true;
+          no-underscore = true;
+        };
+        statix.enable = true;
+        rustfmt = {
+          enable = true;
+          package = config.languages.rust.toolchainPackage;
+        };
+        shellcheck.enable = true;
+        shfmt.enable = true;
+      };
+    };
   };
 
   # https://devenv.sh/git-hooks/
   git-hooks.settings.rust.cargoManifestPath = "./Cargo.toml";
 
-  # Use the same Rust toolchain for git-hooks as for development
-  # This ensures clippy/rustfmt versions match the devenv shell
   git-hooks.tools = {
     cargo = lib.mkForce config.languages.rust.toolchainPackage;
     clippy = lib.mkForce config.languages.rust.toolchainPackage;
@@ -126,15 +136,14 @@ in
   };
 
   git-hooks.hooks = {
-    rustfmt.enable = true;
+    treefmt.enable = true;
     clippy.enable = true;
-    nixpkgs-fmt.enable = true;
   };
 
   # https://devenv.sh/tasks/
   tasks = {
     "test:fmt" = {
-      exec = "cargo fmt --check";
+      exec = "treefmt --fail-on-change";
     };
 
     "test:clippy" = {
@@ -151,7 +160,5 @@ in
   };
 
   # https://devenv.sh/tests/
-  enterTest = "devenv tasks run test:fmt test:clippy test:check test:unit";
-
-  # See full reference at https://devenv.sh/reference/options/
+  enterTest = lib.mkForce "devenv tasks run test:fmt test:clippy test:check test:unit";
 }
