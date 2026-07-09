@@ -234,6 +234,9 @@ impl SessionCache {
                     if !result.model.is_empty() {
                         cached.model = result.model;
                     }
+                    if !result.git_branch.is_empty() {
+                        cached.git_branch = result.git_branch;
+                    }
                     Some(Self::result_from_cache(cached))
                 }
                 std::cmp::Ordering::Equal => Some(Self::result_from_cache(cached)),
@@ -262,10 +265,7 @@ impl SessionCache {
         // even after the parent conversation turn finishes (Idle state).
         let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
-        let mut active_ids = self.update_agent_tracking(path);
-        // Workflow-spawned agents track via per-run journals, not the parent
-        // session JSONL.
-        active_ids.extend(subagents::workflow_active_ids(&subagents_dir));
+        let active_ids = self.update_agent_tracking(path);
         let teammates = self
             .entries
             .get(path)

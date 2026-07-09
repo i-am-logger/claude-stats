@@ -170,16 +170,22 @@ impl AgentTracker {
 
                 // A <teammate-message> idle notification marks a teammate idle.
                 // (A teammate-message WITHOUT idle_notification is its report —
-                // informational, not a lifecycle signal.)
-                if let Some(serde_json::Value::String(content)) = val.pointer("/message/content") {
-                    if content.contains("<teammate-message")
-                        && content.contains("idle_notification")
-                    {
-                        if let Some(name) = teammate_name_from_message(content) {
-                            let status = self.teammates.entry(name.to_string()).or_default();
-                            status.last_idle_at = status.last_idle_at.max(entry_timestamp(val));
+                // informational, not a lifecycle signal.) The content can be a
+                // plain string or an array of content blocks.
+                match val.pointer("/message/content") {
+                    Some(serde_json::Value::String(content)) => {
+                        self.note_teammate_idle(content, val);
+                    }
+                    Some(serde_json::Value::Array(blocks)) => {
+                        for block in blocks {
+                            if let Some(text) =
+                                block.get("text").and_then(serde_json::Value::as_str)
+                            {
+                                self.note_teammate_idle(text, val);
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
             Some("queue-operation") => {
@@ -231,6 +237,16 @@ impl AgentTracker {
     /// Named teammates observed so far, keyed by name.
     pub fn teammates(&self) -> &HashMap<String, TeammateStatus> {
         &self.teammates
+    }
+
+    /// Record an idle notification if `content` is a teammate idle message.
+    fn note_teammate_idle(&mut self, content: &str, val: &serde_json::Value) {
+        if content.contains("<teammate-message") && content.contains("idle_notification") {
+            if let Some(name) = teammate_name_from_message(content) {
+                let status = self.teammates.entry(name.to_string()).or_default();
+                status.last_idle_at = status.last_idle_at.max(entry_timestamp(val));
+            }
+        }
     }
 
     /// Return the set of agent IDs that are still active.
@@ -296,6 +312,7 @@ struct ScanState {
     recent: VecDeque<String>,
     tracker: AgentTracker,
     model: String,
+    git_branch: String,
 }
 
 impl ScanState {
@@ -306,6 +323,7 @@ impl ScanState {
             recent: VecDeque::new(),
             tracker: AgentTracker::new(),
             model: String::new(),
+            git_branch: String::new(),
         }
     }
 
@@ -348,6 +366,13 @@ impl ScanState {
             }
         }
 
+        // Track the LATEST branch — the user can switch branches mid-session.
+        if let Some(branch) = val.get("gitBranch").and_then(serde_json::Value::as_str) {
+            if !branch.is_empty() {
+                self.git_branch = branch.to_string();
+            }
+        }
+
         self.tracker.process(val);
     }
 
@@ -358,6 +383,7 @@ impl ScanState {
             last_lines: self.recent,
             tracker: self.tracker,
             model: self.model,
+            git_branch: self.git_branch,
         }
     }
 }
@@ -373,7 +399,6 @@ pub fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
     let reader = BufReader::new(&mut file);
 
     let mut cwd: Option<String> = None;
-    let mut git_branch = String::new();
     let mut scan = ScanState::new();
 
     for line in reader.lines().map_while(Result::ok) {
@@ -388,14 +413,10 @@ pub fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
             continue;
         };
 
-        // Extract metadata from the first user line (before it has been seen)
+        // Extract the working directory from the first user line; the branch
+        // is tracked continuously by the scan state (it can change).
         if cwd.is_none() && val.get("type").and_then(|t| t.as_str()) == Some("user") {
             cwd = val.get("cwd").and_then(|v| v.as_str()).map(String::from);
-            git_branch = val
-                .get("gitBranch")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
         }
 
         scan.process_parsed(&val);
@@ -404,7 +425,7 @@ pub fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
     let result = scan.into_result();
     Some(SessionFileData {
         cwd: cwd?,
-        git_branch,
+        git_branch: result.git_branch,
         last_tokens: result.last_tokens,
         compactions: result.compactions,
         last_lines: result.last_lines,
@@ -421,6 +442,8 @@ pub struct ScanResult {
     pub last_lines: VecDeque<String>,
     pub(crate) tracker: AgentTracker,
     pub model: String,
+    /// Latest `gitBranch` seen in the scanned range; empty if none.
+    pub git_branch: String,
 }
 
 /// Scan a session file from `offset` to EOF. Tracks token usage, compaction
