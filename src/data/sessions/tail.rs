@@ -12,18 +12,29 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 
 /// Return the context window size for a model based on its API identifier.
 ///
-/// Claude 4.6 (Opus & Sonnet) and Sonnet 4.5 / Sonnet 4 expose a 1 M-token
-/// context window. Older Opus models and Haiku use 200 k.
+/// The Claude 5 family (Fable/Mythos/Sonnet 5), Opus 4.6+, Sonnet 4.6, and
+/// Sonnet 4.5 / Sonnet 4 expose a 1 M-token context window. Haiku, older
+/// Opus models, and anything unrecognised use 200 k.
 pub fn context_window_for_model(model: &str) -> u64 {
-    // 4.6 generation — always 1M
-    if model.contains("opus-4-6") || model.contains("sonnet-4-6") {
+    // Haiku is the only current-generation family still at 200k
+    if model.contains("haiku") {
+        return DEFAULT_CONTEXT_WINDOW;
+    }
+    // Claude 5 family — 1M (also covers mythos-preview)
+    if model.contains("fable") || model.contains("mythos") || model.contains("sonnet-5") {
         return 1_000_000;
     }
-    // Sonnet 4.5 and Sonnet 4 support 1M (Claude Code enables the beta header)
-    if model.contains("sonnet-4-5") || model.contains("sonnet-4-2") {
+    // Opus 4.6 / 4.7 / 4.8 — 1M
+    if model.contains("opus-4-6") || model.contains("opus-4-7") || model.contains("opus-4-8") {
         return 1_000_000;
     }
-    // Haiku 4.5, older Opus, and anything unknown → 200k
+    // Sonnet 4.6, Sonnet 4.5, and Sonnet 4 ("sonnet-4-2..." matches the
+    // date-suffixed claude-sonnet-4-20250514) — 1M
+    if model.contains("sonnet-4-6") || model.contains("sonnet-4-5") || model.contains("sonnet-4-2")
+    {
+        return 1_000_000;
+    }
+    // Older Opus and anything unknown → 200k
     DEFAULT_CONTEXT_WINDOW
 }
 
@@ -411,6 +422,31 @@ mod tests {
     use super::*;
 
     // ── context_window_for_model ──────────────────────────────────
+
+    #[test]
+    fn context_window_fable_5() {
+        assert_eq!(context_window_for_model("claude-fable-5"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_mythos_5() {
+        assert_eq!(context_window_for_model("claude-mythos-5"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_sonnet_5() {
+        assert_eq!(context_window_for_model("claude-sonnet-5"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_opus_4_8() {
+        assert_eq!(context_window_for_model("claude-opus-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_opus_4_7() {
+        assert_eq!(context_window_for_model("claude-opus-4-7"), 1_000_000);
+    }
 
     #[test]
     fn context_window_opus_4_6() {
@@ -890,16 +926,14 @@ mod tests {
         // Seek to exactly after "line1\n" (byte 6) — should discard "line2" partial? No,
         // seek_pos > 0 means it reads+discards one line. At pos 6, it reads "line2" as discard.
         let reader = seek_tail(f.as_file(), 6).unwrap();
-        let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-        assert!(lines.is_empty());
+        assert_eq!(reader.lines().map_while(Result::ok).count(), 0);
     }
 
     #[test]
     fn seek_tail_empty_file() {
         let f = raw_file(b"");
         let reader = seek_tail(f.as_file(), 0).unwrap();
-        let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-        assert!(lines.is_empty());
+        assert_eq!(reader.lines().map_while(Result::ok).count(), 0);
     }
 
     // ── read_last_lines ──────────────────────────────────────────
