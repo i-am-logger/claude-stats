@@ -89,6 +89,23 @@ impl Backoff {
     }
 }
 
+/// Run a blocking closure on the tokio blocking thread pool.
+///
+/// If the task panics, the panic is propagated. If the task is cancelled
+/// (runtime shutting down), `fallback` is returned instead.
+pub(crate) async fn blocking<F, R>(f: F, fallback: R) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| {
+        if e.is_panic() {
+            std::panic::resume_unwind(e.into_panic());
+        }
+        fallback
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,21 +215,4 @@ mod tests {
         assert!(matches!(busy, AppEvent::ResourceBusy(ResourceKind::Disk)));
         assert!(matches!(idle, AppEvent::ResourceIdle(ResourceKind::Disk)));
     }
-}
-
-/// Run a blocking closure on the tokio blocking thread pool.
-///
-/// If the task panics, the panic is propagated. If the task is cancelled
-/// (runtime shutting down), `fallback` is returned instead.
-pub(crate) async fn blocking<F, R>(f: F, fallback: R) -> R
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| {
-        if e.is_panic() {
-            std::panic::resume_unwind(e.into_panic());
-        }
-        fallback
-    })
 }
