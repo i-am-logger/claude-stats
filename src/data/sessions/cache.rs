@@ -429,6 +429,38 @@ mod tests {
         assert_eq!(result.last_tokens, 2000);
     }
 
+    #[test]
+    fn incremental_scan_updates_git_branch() {
+        // A branch switch mid-session appears on later entries; the cache
+        // must pick it up from the incremental read.
+        let user_line =
+            r#"{"type":"user","cwd":"/tmp/p","gitBranch":"main","message":{"content":"hi"}}"#;
+        let f = jsonl_file(&[user_line]);
+        let file_len = f.as_file().metadata().unwrap().len();
+
+        let mut cache = SessionCache::new();
+        let first = cache
+            .read_session_file(f.path(), f.as_file(), file_len)
+            .unwrap();
+        assert_eq!(first.git_branch, "main");
+
+        // Append an entry on a different branch and rescan incrementally
+        let mut file = f.as_file();
+        file.seek(SeekFrom::End(0)).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","cwd":"/tmp/p","gitBranch":"feat/new","message":{{"content":"go"}}}}"#
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        let new_len = file.metadata().unwrap().len();
+
+        let second = cache
+            .read_session_file(f.path(), f.as_file(), new_len)
+            .unwrap();
+        assert_eq!(second.git_branch, "feat/new");
+    }
+
     // ── SessionCache integration ──────────────────────────────────
 
     #[test]

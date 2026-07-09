@@ -94,6 +94,7 @@ fn collect_agents(
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
+    let teams_dir = default_teams_dir();
 
     entries
         .flatten()
@@ -118,7 +119,7 @@ fn collect_agents(
                     .and_then(|m| m.name.clone())
                     .or_else(|| fallback_name.map(String::from))?;
                 let status = teammates.get(&tm_name).copied().unwrap_or_default();
-                return parse_teammate(&path, &tm_name, &status);
+                return parse_teammate(&path, &tm_name, &status, teams_dir.as_deref());
             }
 
             // Background agents tracked via async_launched/task-notification
@@ -155,7 +156,12 @@ fn teammate_name_of(agent_id: &str) -> Option<&str> {
         .then_some(name)
 }
 
-fn parse_teammate(path: &Path, name: &str, status: &TeammateStatus) -> Option<SubagentData> {
+fn parse_teammate(
+    path: &Path,
+    name: &str,
+    status: &TeammateStatus,
+    teams_dir: Option<&Path>,
+) -> Option<SubagentData> {
     // An explicit "X has shut down" frame ends the roster row immediately.
     if status.terminated {
         return None;
@@ -170,8 +176,10 @@ fn parse_teammate(path: &Path, name: &str, status: &TeammateStatus) -> Option<Su
     // NOT mean alive.
     let membership = read_meta(path)
         .and_then(|m| m.team_name)
-        .and_then(|team| default_teams_dir().map(|dir| team_membership(&dir, &team, name)))
-        .unwrap_or(TeamMembership::Unknown);
+        .zip(teams_dir)
+        .map_or(TeamMembership::Unknown, |(team, dir)| {
+            team_membership(dir, &team, name)
+        });
     if matches!(membership, TeamMembership::Absent) {
         return None;
     }
@@ -1196,6 +1204,85 @@ mod tests {
             &HashMap::new(),
         );
         assert!(agents.is_empty());
+    }
+
+    // ── parse_teammate membership + runtime ──────────────────────
+
+    /// Meta + team config fixture: a teammate transcript whose meta names a
+    /// team rooted in the same tempdir.
+    fn write_teammate_with_team(dir: &Path, member_json: &str) -> (PathBuf, PathBuf) {
+        write_agent_file(dir, "amy-fixer-782b353b34c66890", "Fix things", 3_000);
+        let transcript = dir.join("agent-amy-fixer-782b353b34c66890.jsonl");
+        fs::write(
+            dir.join("agent-amy-fixer-782b353b34c66890.meta.json"),
+            r#"{"name":"my-fixer","taskKind":"in_process_teammate","teamName":"session-abc"}"#,
+        )
+        .unwrap();
+        let teams_dir = dir.join("teams");
+        let team_root = teams_dir.join("session-abc");
+        fs::create_dir_all(&team_root).unwrap();
+        fs::write(
+            team_root.join("config.json"),
+            format!(r#"{{"name":"session-abc","members":[{member_json}]}}"#),
+        )
+        .unwrap();
+        (transcript, teams_dir)
+    }
+
+    #[test]
+    fn parse_teammate_removed_member_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        // Config readable but our teammate is not a member — terminated
+        let (transcript, teams_dir) = write_teammate_with_team(
+            dir.path(),
+            r#"{"agentId":"other@session-abc","name":"other","joinedAt":1783569232384}"#,
+        );
+
+        let result = parse_teammate(&transcript, "my-fixer", &spawned_status(), Some(&teams_dir));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_teammate_runtime_from_joined_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let joined = chrono::Utc::now() - chrono::TimeDelta::seconds(90);
+        let member = format!(
+            r#"{{"agentId":"my-fixer@session-abc","name":"my-fixer","joinedAt":{}}}"#,
+            joined.timestamp_millis()
+        );
+        let (transcript, teams_dir) = write_teammate_with_team(dir.path(), &member);
+
+        let data = parse_teammate(&transcript, "my-fixer", &spawned_status(), Some(&teams_dir))
+            .expect("member teammate should render");
+        let runtime = data.runtime_secs.expect("runtime from joinedAt");
+        assert!((85..=95).contains(&runtime), "got {runtime}");
+    }
+
+    #[test]
+    fn parse_teammate_turn_runtime_from_last_user_entry() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let joined = chrono::Utc::now() - chrono::TimeDelta::seconds(600);
+        let member = format!(
+            r#"{{"agentId":"my-fixer@session-abc","name":"my-fixer","joinedAt":{}}}"#,
+            joined.timestamp_millis()
+        );
+        let (transcript, teams_dir) = write_teammate_with_team(dir.path(), &member);
+        // A mailbox message 45s ago started a new turn
+        let turn_start = chrono::Utc::now() - chrono::TimeDelta::seconds(45);
+        let mut f = fs::File::options().append(true).open(&transcript).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"{}","message":{{"content":"next task"}}}}"#,
+            turn_start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        )
+        .unwrap();
+        f.sync_all().unwrap();
+
+        let data = parse_teammate(&transcript, "my-fixer", &spawned_status(), Some(&teams_dir))
+            .expect("member teammate should render");
+        let runtime = data.runtime_secs.expect("turn runtime");
+        assert!((40..=50).contains(&runtime), "got {runtime}");
     }
 
     // ── team_membership ──────────────────────────────────────────

@@ -626,4 +626,157 @@ mod tests {
     fn tree_connector_not_last() {
         assert_eq!(tree_connector(false), "\u{251c} ");
     }
+
+    // ── render (TestBackend) ─────────────────────────────────────
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render the section into a test terminal and return the screen text.
+    fn render_to_text(sessions: &[SessionData], width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let section = ContextsSection { sessions, tick: 0 };
+                let area = frame.area();
+                section.render(frame, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer.cell((x, y)).map_or(" ", |c| c.symbol()));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn render_empty_shows_no_active_contexts() {
+        let text = render_to_text(&[], 60, 5);
+        assert!(text.contains("Active contexts (0)"));
+        assert!(text.contains("No active contexts"));
+    }
+
+    #[test]
+    fn render_session_title_bar_and_info() {
+        let session = make_session(0, SessionState::Working);
+        let text = render_to_text(&[session], 80, 12);
+        assert!(text.contains("Active contexts (1)"));
+        assert!(text.contains("test (30% — 50.00k/200k)"));
+        assert!(text.contains("⎇ main"));
+        assert!(text.contains("5s ago"));
+        assert!(text.contains("Bash(ls)"));
+    }
+
+    #[test]
+    fn render_idle_session_indicator() {
+        let session = make_session(0, SessionState::Idle);
+        let text = render_to_text(&[session], 80, 12);
+        assert!(text.contains("○ test"));
+    }
+
+    #[test]
+    fn render_compactions_shown_when_present() {
+        let mut session = make_session(0, SessionState::Idle);
+        session.compactions = 3;
+        let text = render_to_text(&[session], 80, 12);
+        assert!(text.contains("3x compacted"));
+    }
+
+    #[test]
+    fn render_agent_row_with_name_runtime_and_tokens() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: "Fix things".into(),
+            name: Some("my-fixer".into()),
+            model: ModelShort::Opus,
+            context_tokens: 5_000,
+            runtime_secs: Some(762),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: None,
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("1 agent"));
+        assert!(text.contains("└ my-fixer opus working — Fix things · 12m 42s · ↓5.0k"));
+    }
+
+    #[test]
+    fn render_workflow_row_with_progress() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: String::new(),
+            name: Some("my-flow".into()),
+            model: ModelShort::Unknown,
+            context_tokens: 305_800,
+            runtime_secs: Some(2518),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: Some((1, 2)),
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("1 workflow"));
+        assert!(text.contains("└ my-flow 1/2 agents done · 41m 58s · ↓305.8k"));
+    }
+
+    #[test]
+    fn render_stale_agent_state() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: "Quiet work".into(),
+            name: None,
+            model: ModelShort::Sonnet,
+            context_tokens: 1_000,
+            runtime_secs: None,
+            last_write_age_secs: AGENT_STALE_DISPLAY_SECS + 1,
+            state: SessionState::Working,
+            progress: None,
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("sonnet stale — Quiet work"));
+        // No runtime span when the start time is unknown
+        assert!(!text.contains(" · ↓1.0k · "));
+    }
+
+    #[test]
+    fn render_multiple_agents_use_tree_connectors() {
+        let session = make_session(2, SessionState::Working);
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("├ sonnet working — test"));
+        assert!(text.contains("└ sonnet working — test"));
+        assert!(text.contains("2 agents"));
+    }
+
+    #[test]
+    fn render_idle_session_without_activity_has_no_state_row() {
+        let mut idle = make_session(0, SessionState::Idle);
+        idle.activity = String::new();
+        let working = make_session(0, SessionState::Working);
+        let text = render_to_text(&[idle, working], 80, 16);
+        // Both sessions render; the idle one contributes no activity line
+        assert_eq!(text.matches("⎇ main").count(), 2);
+        assert_eq!(text.matches("Bash(ls)").count(), 1);
+    }
+
+    #[test]
+    fn render_zero_token_agent_omits_token_span() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: "Just started".into(),
+            name: None,
+            model: ModelShort::Unknown,
+            context_tokens: 0,
+            runtime_secs: Some(5),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: None,
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("? working — Just started · 5s"));
+        assert!(!text.contains("↓0.0k"));
+    }
 }

@@ -1199,6 +1199,121 @@ mod tests {
             Some("fix-docrefs")
         );
         assert_eq!(teammate_name_from_message("no tag here"), None);
+        // An id without a team suffix is used verbatim
+        assert_eq!(
+            teammate_name_from_message("<teammate-message teammate_id=\"solo\">"),
+            Some("solo")
+        );
+    }
+
+    #[test]
+    fn teammate_idle_without_spawn_counts_as_idle() {
+        let status = TeammateStatus {
+            spawned_at: None,
+            last_idle_at: Some(chrono::Utc::now()),
+            terminated: false,
+        };
+        assert!(status.is_idle());
+    }
+
+    #[test]
+    fn tracker_teammate_idle_in_array_content() {
+        let val = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-07-09T02:07:22.456Z",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "<teammate-message teammate_id=\"fix-docrefs@t\">{\"type\":\"idle_notification\",\"from\":\"fix-docrefs\"}</teammate-message>"}
+                ]
+            }
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:48.994Z",
+        ));
+        tracker.process(&val);
+        assert!(tracker.teammates()["fix-docrefs"].is_idle());
+    }
+
+    #[test]
+    fn tracker_idle_prefers_embedded_timestamp() {
+        // Delivery entry is stamped minutes after the embedded idle time —
+        // a respawn in between must win the ordering.
+        let idle = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-07-09T02:10:00.000Z",
+            "message": {
+                "content": "<teammate-message teammate_id=\"fix-docrefs@t\">{\"type\":\"idle_notification\",\"timestamp\":\"2026-07-09T02:05:00.000Z\"}</teammate-message>"
+            }
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:00.000Z",
+        ));
+        tracker.process(&idle);
+        // Respawned after the embedded idle time but before delivery
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:07:00.000Z",
+        ));
+        assert!(!tracker.teammates()["fix-docrefs"].is_idle());
+    }
+
+    #[test]
+    fn tracker_merge_propagates_terminated() {
+        let mut a = AgentTracker::new();
+        a.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:48.994Z",
+        ));
+        let mut b = AgentTracker::new();
+        b.process(&serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-07-09T02:10:00.000Z",
+            "message": {
+                "content": "<teammate-message teammate_id=\"system@t\">{\"type\":\"teammate_terminated\",\"message\":\"fix-docrefs has shut down.\"}</teammate-message>"
+            }
+        }));
+        a.merge(&b);
+        assert!(a.teammates()["fix-docrefs"].terminated);
+    }
+
+    #[test]
+    fn terminated_name_requires_shutdown_phrase() {
+        assert_eq!(
+            terminated_teammate_name("{\"message\":\"fix-docrefs has shut down. 0 tasks\"}"),
+            Some("fix-docrefs".to_string())
+        );
+        assert_eq!(
+            terminated_teammate_name("{\"message\":\"fix-docrefs said hello\"}"),
+            None
+        );
+        assert_eq!(terminated_teammate_name("no message field"), None);
+    }
+
+    #[test]
+    fn embedded_timestamp_rejects_garbage() {
+        assert!(embedded_timestamp("{\"timestamp\":\"not-a-date\"}").is_none());
+        assert!(embedded_timestamp("no timestamp").is_none());
+        assert_eq!(
+            embedded_timestamp("{\"timestamp\":\"2026-07-09T02:05:00.000Z\"}")
+                .unwrap()
+                .timestamp(),
+            1_783_562_700
+        );
+    }
+
+    #[test]
+    fn completed_tool_ids_exposed() {
+        let val = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_9"}]}
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.completed_tool_ids().contains("toolu_9"));
     }
 
     // ── seek_tail ──────────────────────────────────────────────────
