@@ -119,6 +119,9 @@ in
         rustfmt = {
           enable = true;
           package = config.languages.rust.toolchainPackage;
+          # Match the crate edition in Cargo.toml — otherwise treefmt's bare
+          # rustfmt and `cargo fmt` disagree on import ordering and fight.
+          edition = "2021";
         };
         shellcheck.enable = true;
         shfmt.enable = true;
