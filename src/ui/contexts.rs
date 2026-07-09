@@ -300,8 +300,6 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
             return;
         };
         let connector = tree_connector(idx + 1 == agents.len());
-        let (a_state, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
-        let tokens_k = format_agent_tokens_k(agent.context_tokens);
         let mut spans = vec![Span::styled(connector, Style::default().fg(DIM))];
         if let Some(name) = &agent.name {
             spans.push(Span::styled(
@@ -311,23 +309,39 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        spans.extend([
-            Span::styled(agent.model.to_string(), Style::default().fg(Color::Blue)),
-            Span::styled(format!(" {tokens_k}"), Style::default().fg(DIM)),
-        ]);
+        if let Some((done, total)) = agent.progress {
+            // Aggregated workflow run — mirrors Claude Code's roster entry.
+            let (_, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
+            spans.push(Span::styled(
+                format!("{done}/{total} agents done"),
+                Style::default().fg(a_color),
+            ));
+        } else {
+            let (a_state, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
+            spans.push(Span::styled(
+                agent.model.to_string(),
+                Style::default().fg(Color::Blue),
+            ));
+            spans.push(Span::styled(
+                format!(" {a_state}"),
+                Style::default().fg(a_color),
+            ));
+            if !agent.task.is_empty() {
+                spans.push(Span::styled(
+                    format!(" — {}", agent.task),
+                    Style::default().fg(DIM),
+                ));
+            }
+        }
         if let Some(runtime) = agent.runtime_secs {
             spans.push(Span::styled(
-                format!(" {}", format_runtime(runtime)),
+                format!(" · {}", format_runtime(runtime)),
                 Style::default().fg(DIM),
             ));
         }
-        spans.push(Span::styled(
-            format!(" {a_state}"),
-            Style::default().fg(a_color),
-        ));
-        if !agent.task.is_empty() {
+        if agent.context_tokens > 0 {
             spans.push(Span::styled(
-                format!(" — {}", agent.task),
+                format!(" · \u{2193}{}", format_agent_tokens_k(agent.context_tokens)),
                 Style::default().fg(DIM),
             ));
         }
@@ -357,6 +371,7 @@ mod tests {
                     runtime_secs: Some(90),
                     last_write_age_secs: 0,
                     state: SessionState::Working,
+                    progress: None,
                 })
                 .collect(),
             compactions: 0,

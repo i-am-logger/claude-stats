@@ -63,6 +63,9 @@ pub struct SubagentData {
     /// displayed state of agents that stopped writing without a completion
     /// marker.
     pub last_write_age_secs: u64,
+    /// For rows that aggregate a whole workflow run: `(done, total)` agent
+    /// counts. `None` for individual agents.
+    pub progress: Option<(u32, u32)>,
     /// Used for display only; active/completed filtering uses parent JSONL tracking.
     pub state: SessionState,
 }

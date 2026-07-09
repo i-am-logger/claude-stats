@@ -26,13 +26,18 @@ pub(crate) const AGENT_STALE_SECS: u64 = 1800;
 /// stays on the roster briefly, then drops off.
 pub(crate) const TEAMMATE_IDLE_HIDE_SECS: u64 = 900;
 
+/// How long a finished workflow run ("N/N agents done") lingers on the
+/// roster after its last write before disappearing.
+pub(crate) const RUN_DONE_LINGER_SECS: u64 = 120;
+
 /// Scan subagent JSONL files and return data for agents that are still active.
 ///
-/// `active_ids` is the set of Task-tool and workflow agent IDs (e.g.
-/// `"a2a043d116fbd87f0"`) that parent-JSONL tracking and workflow journals
-/// show as still in-progress. `teammates` maps named-teammate lifecycle
-/// statuses observed in the parent JSONL; their transcripts are matched by
-/// the name embedded in the filename (`agent-a<name>-<hash>.jsonl`).
+/// `active_ids` is the set of Task-tool agent IDs (e.g.
+/// `"a2a043d116fbd87f0"`) that parent-JSONL tracking shows as still
+/// in-progress. `teammates` maps named-teammate lifecycle statuses observed
+/// in the parent JSONL; their transcripts are matched by the name embedded
+/// in the filename (`agent-a<name>-<hash>.jsonl`). Workflow runs under
+/// `subagents/workflows/<run-id>/` aggregate into a single row each.
 #[allow(
     clippy::implicit_hasher,
     reason = "internal API, always called with std collections"
@@ -42,28 +47,13 @@ pub fn scan_subagents(
     active_ids: &HashSet<String>,
     teammates: &HashMap<String, TeammateStatus>,
 ) -> Vec<SubagentData> {
-    if active_ids.is_empty() && teammates.is_empty() {
-        return Vec::new();
-    }
+    let mut agents = if active_ids.is_empty() && teammates.is_empty() {
+        Vec::new()
+    } else {
+        collect_agents(subagents_dir, active_ids, teammates)
+    };
 
-    let mut agents = collect_agents(subagents_dir, active_ids, teammates);
-
-    // Workflow-spawned agents live one level deeper:
-    // subagents/workflows/<run-id>/agent-<id>.jsonl. Gate on transcript
-    // freshness — a dead run's journal keeps its orphans forever.
-    if let Ok(runs) = fs::read_dir(subagents_dir.join("workflows")) {
-        let no_teammates = HashMap::new();
-        for run in runs.flatten() {
-            let path = run.path();
-            if path.is_dir() {
-                agents.extend(
-                    collect_agents(&path, active_ids, &no_teammates)
-                        .into_iter()
-                        .filter(|a| a.last_write_age_secs <= AGENT_STALE_SECS),
-                );
-            }
-        }
-    }
+    agents.extend(scan_workflow_runs(subagents_dir));
 
     dedup_teammates(&mut agents);
 
@@ -115,28 +105,28 @@ fn collect_agents(
             // Extract agent ID from filename: "agent-a2a043d116fbd87f0" → "a2a043d116fbd87f0"
             let agent_id = name.strip_prefix("agent-")?;
 
-            // Task-tool / workflow agents confirmed active by id
+            // Task-tool agents confirmed active by id
             if active_ids.contains(agent_id) {
                 return parse_subagent(&path);
             }
 
             // Named teammates: the transcript id embeds the name
-            let (tm_name, status) = teammates
-                .iter()
-                .find(|(n, _)| matches_teammate_id(agent_id, n))?;
+            let tm_name = teammate_name_of(agent_id)?;
+            let status = teammates.get(tm_name)?;
             parse_teammate(&path, tm_name, status)
         })
         .collect()
 }
 
-/// A teammate transcript id is `a<name>-<hash>` — e.g.
-/// `afix-load-docrefs-fb64396d7b46c88f` for teammate "fix-load-docrefs".
-fn matches_teammate_id(agent_id: &str, name: &str) -> bool {
-    agent_id
-        .strip_prefix('a')
-        .and_then(|rest| rest.strip_prefix(name))
-        .and_then(|rest| rest.strip_prefix('-'))
-        .is_some_and(|hash| !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+/// Extract the teammate name from a transcript id of the form
+/// `a<name>-<hash>` — e.g. `afix-load-docrefs-fb64396d7b46c88f` →
+/// "fix-load-docrefs". Anonymous ids (`a2a043d116fbd87f0`, no dash) yield
+/// `None`.
+fn teammate_name_of(agent_id: &str) -> Option<&str> {
+    let rest = agent_id.strip_prefix('a')?;
+    let (name, hash) = rest.rsplit_once('-')?;
+    (!name.is_empty() && !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(name)
 }
 
 fn parse_teammate(path: &Path, name: &str, status: &TeammateStatus) -> Option<SubagentData> {
@@ -158,57 +148,158 @@ fn parse_teammate(path: &Path, name: &str, status: &TeammateStatus) -> Option<Su
     Some(data)
 }
 
-/// Collect agent IDs that workflow journals show as started but not finished.
+/// Aggregate each workflow run under `subagents/workflows/<run-id>/` into a
+/// single roster row: run name, "done/total agents" progress, summed tokens,
+/// and runtime — mirroring how Claude Code presents workflow runs.
 ///
 /// Workflow runs don't emit `agent_progress` entries in the parent session
-/// JSONL; instead each run journals into
-/// `subagents/workflows/<run-id>/journal.jsonl` with one
+/// JSONL; each run journals into `<run-id>/journal.jsonl` with one
 /// `{"type":"started","agentId":...}` line per launched agent and a matching
 /// `{"type":"result",...}` line when it completes.
-#[allow(
-    clippy::implicit_hasher,
-    reason = "internal API, always called with std HashMap"
-)]
-pub fn workflow_active_ids(subagents_dir: &Path) -> HashSet<String> {
-    let mut started = HashSet::new();
-    let mut finished: HashSet<String> = HashSet::new();
-
+fn scan_workflow_runs(subagents_dir: &Path) -> Vec<SubagentData> {
     let Ok(runs) = fs::read_dir(subagents_dir.join("workflows")) else {
-        return started;
+        return Vec::new();
     };
+    // Run scripts are saved as <session-dir>/workflows/scripts/<name>-<run-id>.js
+    let scripts_dir = subagents_dir
+        .parent()
+        .map(|session| session.join("workflows").join("scripts"));
 
-    for run in runs.flatten() {
-        // Journals accumulate (one dir per run, results can be large) — skip
-        // runs where nothing has been written recently instead of re-parsing
-        // dead journals every scan.
-        if !dir_recently_written(&run.path(), AGENT_STALE_SECS) {
-            continue;
-        }
-        let journal = run.path().join("journal.jsonl");
-        let Ok(file) = fs::File::open(&journal) else {
+    runs.flatten()
+        .filter_map(|run| {
+            let run_dir = run.path();
+            if !run_dir.is_dir() {
+                return None;
+            }
+            // Journals accumulate (one dir per run, results can be large) —
+            // skip runs where nothing has been written recently instead of
+            // re-parsing dead journals every scan.
+            if !dir_recently_written(&run_dir, AGENT_STALE_SECS) {
+                return None;
+            }
+            parse_workflow_run(&run_dir, scripts_dir.as_deref())
+        })
+        .collect()
+}
+
+fn parse_workflow_run(run_dir: &Path, scripts_dir: Option<&Path>) -> Option<SubagentData> {
+    let journal = fs::File::open(run_dir.join("journal.jsonl")).ok()?;
+    let mut started: HashSet<String> = HashSet::new();
+    let mut finished: HashSet<String> = HashSet::new();
+    for line in BufReader::new(journal).lines().map_while(Result::ok) {
+        let Some(val) = parse_json_line(&line) else {
             continue;
         };
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Some(val) = parse_json_line(&line) else {
+        let Some(id) = val.get("agentId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        match val.get("type").and_then(|v| v.as_str()) {
+            Some("started") => {
+                started.insert(id.to_string());
+            }
+            Some("result") => {
+                finished.insert(id.to_string());
+            }
+            _ => {}
+        }
+    }
+    if started.is_empty() {
+        return None;
+    }
+    let total = started.len() as u32;
+    let done = started.iter().filter(|id| finished.contains(*id)).count() as u32;
+
+    // Aggregate the run's agent transcripts: summed tokens, earliest start,
+    // freshest write.
+    let mut context_tokens: u64 = 0;
+    let mut started_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut last_write_age_secs = u64::MAX;
+    if let Ok(entries) = fs::read_dir(run_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_agent_transcript = path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("agent-"));
+            if !is_agent_transcript {
+                continue;
+            }
+            let Ok(file) = fs::File::open(&path) else {
                 continue;
             };
-            let Some(id) = val.get("agentId").and_then(|v| v.as_str()) else {
+            let Ok(metadata) = file.metadata() else {
                 continue;
             };
-            match val.get("type").and_then(|v| v.as_str()) {
-                Some("started") => {
-                    started.insert(id.to_string());
+            let age = metadata
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .map_or(0, |d| d.as_secs());
+            last_write_age_secs = last_write_age_secs.min(age);
+            let (_, first_ts) = read_subagent_head(&file);
+            started_at = match (started_at, first_ts) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let (_, tokens) = read_subagent_usage(&file, metadata.len());
+            context_tokens += tokens;
+        }
+    }
+    if last_write_age_secs == u64::MAX {
+        last_write_age_secs = 0;
+    }
+
+    let running = done < total;
+    // A finished run lingers briefly, then drops off the roster.
+    if !running && last_write_age_secs > RUN_DONE_LINGER_SECS {
+        return None;
+    }
+
+    let runtime_secs = started_at.map(|t| {
+        (chrono::Utc::now() - t)
+            .num_seconds()
+            .max(0)
+            .cast_unsigned()
+    });
+
+    Some(SubagentData {
+        task: String::new(),
+        name: Some(workflow_run_name(run_dir, scripts_dir)),
+        model: ModelShort::Unknown,
+        context_tokens,
+        runtime_secs,
+        last_write_age_secs,
+        state: if running {
+            SessionState::Working
+        } else {
+            SessionState::Idle
+        },
+        progress: Some((done, total)),
+    })
+}
+
+/// Resolve a workflow run's human name from its persisted script:
+/// `<session>/workflows/scripts/<name>-<run-id>.js`. Falls back to the
+/// run-dir name (`wf_...`).
+fn workflow_run_name(run_dir: &Path, scripts_dir: Option<&Path>) -> String {
+    let run_id = run_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let suffix = format!("-{run_id}.js");
+    if let Some(entries) = scripts_dir.and_then(|d| fs::read_dir(d).ok()) {
+        for entry in entries.flatten() {
+            if let Some(file_name) = entry.file_name().to_str() {
+                if let Some(name) = file_name.strip_suffix(&suffix) {
+                    if !name.is_empty() {
+                        return name.to_string();
+                    }
                 }
-                Some("result") => {
-                    finished.insert(id.to_string());
-                }
-                _ => {}
             }
         }
     }
-
-    started.retain(|id| !finished.contains(id));
-    started
+    run_id.to_string()
 }
 
 /// Whether any file directly inside `dir` was modified within `max_age_secs`.
@@ -284,6 +375,7 @@ fn parse_subagent(path: &Path) -> Option<SubagentData> {
         runtime_secs,
         last_write_age_secs,
         state,
+        progress: None,
     })
 }
 
@@ -480,48 +572,116 @@ mod tests {
         assert!(agents.is_empty());
     }
 
-    #[test]
-    fn scan_subagents_finds_workflow_agents() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join("workflows").join("wf_abc123");
-        fs::create_dir_all(&run_dir).unwrap();
-        write_agent_file(&run_dir, "wfagent1", "Verify hypothesis", 2_000);
-
-        let active = HashSet::from(["wfagent1".to_string()]);
-        let agents = scan_subagents(dir.path(), &active, &HashMap::new());
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].task, "Verify hypothesis");
-    }
-
-    #[test]
-    fn scan_subagents_merges_direct_and_workflow_agents() {
-        let dir = tempfile::tempdir().unwrap();
-        write_agent_file(dir.path(), "direct1", "Direct agent", 1_000);
-        let run_dir = dir.path().join("workflows").join("wf_abc123");
-        fs::create_dir_all(&run_dir).unwrap();
-        write_agent_file(&run_dir, "wfagent1", "Workflow agent", 2_000);
-
-        let active = HashSet::from(["direct1".to_string(), "wfagent1".to_string()]);
-        let agents = scan_subagents(dir.path(), &active, &HashMap::new());
-        assert_eq!(agents.len(), 2);
-    }
-
     fn set_mtime_ago(path: &Path, secs: u64) {
         let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
         let f = fs::File::options().write(true).open(path).unwrap();
         f.set_times(fs::FileTimes::new().set_modified(t)).unwrap();
     }
 
-    #[test]
-    fn scan_subagents_excludes_stale_workflow_agents() {
-        let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join("workflows").join("wf_dead");
+    /// Create a workflow run dir with a journal (2 started, 1 finished) and
+    /// two agent transcripts.
+    fn write_workflow_run(subagents_dir: &Path, run_id: &str) -> PathBuf {
+        let run_dir = subagents_dir.join("workflows").join(run_id);
         fs::create_dir_all(&run_dir).unwrap();
-        write_agent_file(&run_dir, "orphan1", "Dead workflow agent", 2_000);
-        set_mtime_ago(&run_dir.join("agent-orphan1.jsonl"), AGENT_STALE_SECS + 60);
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            concat!(
+                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"wf1\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"wf1\",\"result\":\"ok\"}\n",
+                "{\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"wf2\"}\n",
+            ),
+        )
+        .unwrap();
+        write_agent_file(&run_dir, "wf1", "First workflow agent", 2_000);
+        write_agent_file(&run_dir, "wf2", "Second workflow agent", 3_000);
+        run_dir
+    }
 
-        let active = HashSet::from(["orphan1".to_string()]);
+    #[test]
+    fn scan_subagents_aggregates_workflow_run() {
+        let dir = tempfile::tempdir().unwrap();
+        write_workflow_run(dir.path(), "wf_abc123");
+
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        assert_eq!(agents.len(), 1);
+        let run = &agents[0];
+        assert_eq!(run.progress, Some((1, 2)));
+        // Falls back to the run id when no script maps the name
+        assert_eq!(run.name.as_deref(), Some("wf_abc123"));
+        // Tokens are summed across the run's agents
+        assert_eq!(run.context_tokens, 5_000);
+        assert_eq!(run.state, SessionState::Working);
+    }
+
+    #[test]
+    fn scan_subagents_workflow_run_named_from_script() {
+        let root = tempfile::tempdir().unwrap();
+        let subagents_dir = root.path().join("subagents");
+        write_workflow_run(&subagents_dir, "wf_abc123");
+        let scripts = root.path().join("workflows").join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(scripts.join("my-flow-wf_abc123.js"), "export const meta").unwrap();
+
+        let agents = scan_subagents(&subagents_dir, &HashSet::new(), &HashMap::new());
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name.as_deref(), Some("my-flow"));
+    }
+
+    #[test]
+    fn scan_subagents_merges_direct_agents_and_workflow_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_file(dir.path(), "direct1", "Direct agent", 1_000);
+        write_workflow_run(dir.path(), "wf_abc123");
+
+        let active = HashSet::from(["direct1".to_string()]);
         let agents = scan_subagents(dir.path(), &active, &HashMap::new());
+        assert_eq!(agents.len(), 2);
+        assert_eq!(
+            agents.iter().filter(|a| a.progress.is_some()).count(),
+            1,
+            "exactly one aggregated workflow row"
+        );
+    }
+
+    #[test]
+    fn scan_subagents_excludes_stale_workflow_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = write_workflow_run(dir.path(), "wf_dead");
+        for entry in fs::read_dir(&run_dir).unwrap().flatten() {
+            set_mtime_ago(&entry.path(), AGENT_STALE_SECS + 60);
+        }
+
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn scan_subagents_finished_workflow_run_lingers_then_hides() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = write_workflow_run(dir.path(), "wf_done");
+        // Balance the journal: both agents finished
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            concat!(
+                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"wf1\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"wf1\",\"result\":\"ok\"}\n",
+                "{\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"wf2\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k2\",\"agentId\":\"wf2\",\"result\":\"ok\"}\n",
+            ),
+        )
+        .unwrap();
+
+        // Fresh: lingers with full progress and Idle state
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].progress, Some((2, 2)));
+        assert_eq!(agents[0].state, SessionState::Idle);
+
+        // Quiet past the linger window: hidden
+        for entry in fs::read_dir(&run_dir).unwrap().flatten() {
+            set_mtime_ago(&entry.path(), RUN_DONE_LINGER_SECS + 60);
+        }
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
         assert!(agents.is_empty());
     }
 
@@ -662,76 +822,53 @@ mod tests {
         assert_eq!(agents[0].task, "Curated task title");
     }
 
-    // ── matches_teammate_id ──────────────────────────────────────
+    // ── teammate_name_of ─────────────────────────────────────────
 
     #[test]
-    fn teammate_id_matches_name_with_hash() {
-        assert!(matches_teammate_id(
-            "afix-load-docrefs-fb64396d7b46c88f",
-            "fix-load-docrefs"
-        ));
+    fn teammate_name_extracted_from_id() {
+        assert_eq!(
+            teammate_name_of("afix-load-docrefs-fb64396d7b46c88f"),
+            Some("fix-load-docrefs")
+        );
     }
 
     #[test]
-    fn teammate_id_rejects_wrong_name() {
-        assert!(!matches_teammate_id(
-            "afix-load-docrefs-fb64396d7b46c88f",
-            "fix-load"
-        ));
-        assert!(!matches_teammate_id(
-            "a2a043d116fbd87f0",
-            "fix-load-docrefs"
-        ));
+    fn teammate_name_none_for_anonymous_id() {
+        assert_eq!(teammate_name_of("a2a043d116fbd87f0"), None);
     }
 
     #[test]
-    fn teammate_id_rejects_non_hex_suffix() {
-        assert!(!matches_teammate_id("amy-fixer-notahash!", "my-fixer"));
-        assert!(!matches_teammate_id("amy-fixer-", "my-fixer"));
+    fn teammate_name_none_for_non_hex_suffix() {
+        assert_eq!(teammate_name_of("amy-fixer-notahash!"), None);
+        assert_eq!(teammate_name_of("amy-fixer-"), None);
     }
 
-    // ── workflow_active_ids ──────────────────────────────────────
+    #[test]
+    fn teammate_name_splits_at_last_dash() {
+        // Name segments containing dashes stay intact
+        assert_eq!(
+            teammate_name_of("aw4-dedup-census-1161ac98aa13d730"),
+            Some("w4-dedup-census")
+        );
+    }
+
+    // ── workflow run helpers ─────────────────────────────────────
 
     #[test]
-    fn workflow_active_ids_started_without_result() {
+    fn workflow_run_missing_journal_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join("workflows").join("wf_abc123");
+        let run_dir = dir.path().join("workflows").join("wf_nojournal");
         fs::create_dir_all(&run_dir).unwrap();
-        fs::write(
-            run_dir.join("journal.jsonl"),
-            concat!(
-                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a1\"}\n",
-                "{\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}\n",
-                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"a1\",\"result\":\"done\"}\n",
-            ),
-        )
-        .unwrap();
+        write_agent_file(&run_dir, "wf1", "No journal here", 1_000);
 
-        let ids = workflow_active_ids(dir.path());
-        assert_eq!(ids, HashSet::from(["a2".to_string()]));
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        assert!(agents.is_empty());
     }
 
     #[test]
-    fn workflow_active_ids_all_finished() {
+    fn workflow_run_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let run_dir = dir.path().join("workflows").join("wf_done");
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::write(
-            run_dir.join("journal.jsonl"),
-            concat!(
-                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a1\"}\n",
-                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"a1\",\"result\":\"ok\"}\n",
-            ),
-        )
-        .unwrap();
-
-        assert!(workflow_active_ids(dir.path()).is_empty());
-    }
-
-    #[test]
-    fn workflow_active_ids_missing_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(workflow_active_ids(dir.path()).is_empty());
+        assert!(scan_workflow_runs(dir.path()).is_empty());
     }
 
     // ── read_subagent_task prefix stripping ─────────────────────
