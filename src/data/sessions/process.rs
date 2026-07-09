@@ -10,6 +10,21 @@ fn encode_cwd(path: &std::path::Path) -> OsString {
     OsString::from(s.replace('/', "-"))
 }
 
+/// Check whether the first NUL-separated token of a `/proc/<pid>/cmdline`
+/// buffer names a `claude` binary — either the bare name or a path whose
+/// basename is `claude` (e.g. `/usr/local/bin/claude`). Deliberately does
+/// not match `claude-code-proxy`, `claude-stats`, etc.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn argv0_is_claude(cmdline: &[u8]) -> bool {
+    cmdline
+        .split(|&b| b == 0)
+        .next()
+        .and_then(|argv0| std::str::from_utf8(argv0).ok())
+        .is_some_and(|s| {
+            std::path::Path::new(s).file_name() == Some(std::ffi::OsStr::new("claude"))
+        })
+}
+
 /// Whether process-based session detection is available on this platform.
 /// When `true`, `active_project_dirs()` returns the real set of active
 /// projects. When `false`, it returns an empty set and callers should fall
@@ -37,11 +52,18 @@ fn scan_proc() -> HashMap<OsString, usize> {
     use std::fs;
     use std::path::Path;
 
-    /// Check if `/proc/<pid>/comm` is "claude".
+    /// Check if `/proc/<pid>` belongs to a running `claude` CLI.
+    ///
+    /// `comm` catches direct execs and the node-based packaging (which sets
+    /// the process title). The nixpkgs packaging (≥ 2.1.170) launches the
+    /// native binary through the glibc loader, so `comm` reads
+    /// "ld-linux-x86-64" — fall back to argv[0], which the wrapper sets to
+    /// "claude" via `exec -a`.
     fn is_claude_process(pid_dir: &Path) -> bool {
-        fs::read_to_string(pid_dir.join("comm"))
-            .map(|s| s.trim() == "claude")
-            .unwrap_or(false)
+        if fs::read_to_string(pid_dir.join("comm")).is_ok_and(|s| s.trim() == "claude") {
+            return true;
+        }
+        fs::read(pid_dir.join("cmdline")).is_ok_and(|buf| argv0_is_claude(&buf))
     }
 
     /// Read the CWD symlink of a process.
@@ -129,9 +151,52 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn process_detection_available_on_linux() {
-        assert!(AVAILABLE);
         // Smoke test: should not panic.
         let _dirs = active_project_dirs();
+    }
+
+    // ── argv0_is_claude ───────────────────────────────────────────
+
+    #[test]
+    fn argv0_bare_claude_with_args() {
+        // nixpkgs loader form: argv[0] is "claude" via `exec -a`
+        assert!(argv0_is_claude(
+            b"claude\0--library-path\0/nix/store/lib\0/nix/store/claude-code/claude\0"
+        ));
+    }
+
+    #[test]
+    fn argv0_path_basename_claude() {
+        assert!(argv0_is_claude(b"/usr/local/bin/claude\0"));
+    }
+
+    #[test]
+    fn argv0_bare_claude_no_nul() {
+        assert!(argv0_is_claude(b"claude"));
+    }
+
+    #[test]
+    fn argv0_rejects_prefixed_names() {
+        assert!(!argv0_is_claude(b"claude-code-proxy\0"));
+        assert!(!argv0_is_claude(b"claude-stats\0"));
+    }
+
+    #[test]
+    fn argv0_rejects_loader_path() {
+        assert!(!argv0_is_claude(
+            b"/nix/store/glibc-2.42/lib/ld-linux-x86-64.so.2\0--library-path\0"
+        ));
+    }
+
+    #[test]
+    fn argv0_empty_cmdline() {
+        // Kernel threads have an empty cmdline.
+        assert!(!argv0_is_claude(b""));
+    }
+
+    #[test]
+    fn argv0_invalid_utf8() {
+        assert!(!argv0_is_claude(&[0xff, 0xfe, 0x00]));
     }
 
     // ── property tests ────────────────────────────────────────────
