@@ -731,7 +731,7 @@ mod tests {
                 type_str in arb_type(),
             ) {
                 let lines: VecDeque<String> = (0..line_count)
-                    .map(|_| format!(r#"{{"type":"{}"}}"#, type_str))
+                    .map(|_| format!(r#"{{"type":"{type_str}"}}"#))
                     .collect();
                 let (state, _activity) = detect_state_and_activity(&lines);
                 // State must be a valid variant

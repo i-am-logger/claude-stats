@@ -262,7 +262,10 @@ impl SessionCache {
         // even after the parent conversation turn finishes (Idle state).
         let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
-        let active_ids = self.update_agent_tracking(path);
+        let mut active_ids = self.update_agent_tracking(path);
+        // Workflow-spawned agents track via per-run journals, not the parent
+        // session JSONL.
+        active_ids.extend(subagents::workflow_active_ids(&subagents_dir));
         let agents = subagents::scan_subagents(&subagents_dir, &active_ids);
 
         let context_window = tail::context_window_for_model(&sfr.model);

@@ -135,7 +135,7 @@ mod tests {
         let err = FetchError::RateLimited { retry_at };
         let secs = err.rate_limit_remaining_secs().unwrap();
         // Allow 1s tolerance for test execution time
-        assert!(secs >= 119 && secs <= 120, "got {secs}");
+        assert!((119..=120).contains(&secs), "got {secs}");
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
     fn parse_retry_after_seconds() {
         let dt = parse_retry_after("120").unwrap();
         let secs = dt.signed_duration_since(Utc::now()).num_seconds();
-        assert!(secs >= 119 && secs <= 120, "got {secs}");
+        assert!((119..=120).contains(&secs), "got {secs}");
     }
 
     #[test]
@@ -224,7 +224,7 @@ mod tests {
         match err {
             FetchError::RateLimited { retry_at } => {
                 let secs = retry_at.signed_duration_since(Utc::now()).num_seconds();
-                assert!(secs >= 119 && secs <= 120, "got {secs}");
+                assert!((119..=120).contains(&secs), "got {secs}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
@@ -238,7 +238,7 @@ mod tests {
         match err {
             FetchError::RateLimited { retry_at } => {
                 let secs = retry_at.signed_duration_since(Utc::now()).num_seconds();
-                assert!(secs >= 899 && secs <= 900, "got {secs}");
+                assert!((899..=900).contains(&secs), "got {secs}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
@@ -256,7 +256,7 @@ mod tests {
         match err {
             FetchError::RateLimited { retry_at } => {
                 let secs = retry_at.signed_duration_since(Utc::now()).num_seconds();
-                assert!(secs >= 899 && secs <= 900, "got {secs}");
+                assert!((899..=900).contains(&secs), "got {secs}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }

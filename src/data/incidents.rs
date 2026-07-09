@@ -123,6 +123,29 @@ pub(crate) struct StatusData {
     pub(crate) incidents: Vec<Incident>,
 }
 
+pub(crate) async fn fetch_status(
+    client: &reqwest::Client,
+) -> Result<StatusData, crate::error::FetchError> {
+    let (status_resp, incidents_resp) = tokio::join!(
+        client.get(STATUS_API_URL).send(),
+        client.get(INCIDENTS_API_URL).send(),
+    );
+
+    let summary = {
+        let resp = crate::error::check_response(status_resp?).await?;
+        let data: StatusResponse = resp.json().await?;
+        data.status
+    };
+
+    let incidents = {
+        let resp = crate::error::check_response(incidents_resp?).await?;
+        let data: IncidentsResponse = resp.json().await?;
+        data.incidents
+    };
+
+    Ok(StatusData { summary, incidents })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,27 +292,4 @@ mod tests {
             }
         }
     }
-}
-
-pub(crate) async fn fetch_status(
-    client: &reqwest::Client,
-) -> Result<StatusData, crate::error::FetchError> {
-    let (status_resp, incidents_resp) = tokio::join!(
-        client.get(STATUS_API_URL).send(),
-        client.get(INCIDENTS_API_URL).send(),
-    );
-
-    let summary = {
-        let resp = crate::error::check_response(status_resp?).await?;
-        let data: StatusResponse = resp.json().await?;
-        data.status
-    };
-
-    let incidents = {
-        let resp = crate::error::check_response(incidents_resp?).await?;
-        let data: IncidentsResponse = resp.json().await?;
-        data.incidents
-    };
-
-    Ok(StatusData { summary, incidents })
 }

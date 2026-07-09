@@ -6,10 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Poll interval (in ticks) when the filesystem watcher is unavailable.
-/// At 500ms per tick this gives a 5-second scan cadence, matching the
-/// usage/status workers.
-const FALLBACK_POLL_TICKS: u64 = 10;
+/// Heartbeat rescan interval in ticks. At 500ms per tick this gives a
+/// 5-second cadence, matching the usage/status workers. With a working
+/// watcher this is a safety net: sessions change without emitting `.jsonl`
+/// events (a `claude` process exits, activity labels age) and inotify
+/// events can be missed or coalesced. Without a watcher it is the sole
+/// scan trigger.
+const HEARTBEAT_TICKS: u64 = 10;
 
 pub(crate) fn spawn(tx: EventTx) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -27,15 +30,18 @@ pub(crate) fn spawn(tx: EventTx) -> tokio::task::JoinHandle<()> {
         loop {
             interval.tick().await;
 
-            let should_scan = if has_watcher {
-                dirty.swap(false, Ordering::AcqRel)
-            } else {
-                poll_counter += 1;
-                poll_counter >= FALLBACK_POLL_TICKS && {
-                    poll_counter = 0;
-                    true
-                }
-            };
+            poll_counter += 1;
+            let heartbeat = poll_counter >= HEARTBEAT_TICKS;
+            if heartbeat {
+                poll_counter = 0;
+            }
+            // Watcher events give sub-second latency; the heartbeat keeps
+            // process liveness and activity labels honest between events.
+            // Read-and-clear dirty unconditionally so a heartbeat scan also
+            // consumes a pending watcher event instead of leaving it to
+            // trigger a redundant rescan next tick.
+            let dirty_seen = has_watcher && dirty.swap(false, Ordering::AcqRel);
+            let should_scan = heartbeat || dirty_seen;
 
             if should_scan {
                 let (data, returned_cache) = {

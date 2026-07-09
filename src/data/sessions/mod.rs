@@ -27,6 +27,8 @@ pub enum SessionState {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ModelShort {
+    Fable,
+    Mythos,
     Opus,
     Sonnet,
     Haiku,
@@ -37,6 +39,8 @@ pub enum ModelShort {
 impl std::fmt::Display for ModelShort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Fable => write!(f, "fable"),
+            Self::Mythos => write!(f, "mythos"),
             Self::Opus => write!(f, "opus"),
             Self::Sonnet => write!(f, "sonnet"),
             Self::Haiku => write!(f, "haiku"),

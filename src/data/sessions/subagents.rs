@@ -9,7 +9,7 @@ use super::{ModelShort, SubagentData};
 use crate::fmt::truncate_str;
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 /// Scan subagent JSONL files and return data for agents that are still active.
@@ -27,11 +27,30 @@ pub fn scan_subagents(subagents_dir: &Path, active_ids: &HashSet<String>) -> Vec
         return Vec::new();
     }
 
-    let Ok(entries) = fs::read_dir(subagents_dir) else {
+    let mut agents = collect_agents(subagents_dir, active_ids);
+
+    // Workflow-spawned agents live one level deeper:
+    // subagents/workflows/<run-id>/agent-<id>.jsonl
+    if let Ok(runs) = fs::read_dir(subagents_dir.join("workflows")) {
+        for run in runs.flatten() {
+            let path = run.path();
+            if path.is_dir() {
+                agents.extend(collect_agents(&path, active_ids));
+            }
+        }
+    }
+
+    agents.sort_by(|a, b| a.task.cmp(&b.task));
+    agents
+}
+
+/// Collect active `agent-<id>.jsonl` transcripts directly inside `dir`.
+fn collect_agents(dir: &Path, active_ids: &HashSet<String>) -> Vec<SubagentData> {
+    let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
 
-    let mut agents: Vec<SubagentData> = entries
+    entries
         .flatten()
         .filter_map(|e| {
             let path = e.path();
@@ -47,10 +66,54 @@ pub fn scan_subagents(subagents_dir: &Path, active_ids: &HashSet<String>) -> Vec
             }
             parse_subagent(&path)
         })
-        .collect();
+        .collect()
+}
 
-    agents.sort_by(|a, b| a.task.cmp(&b.task));
-    agents
+/// Collect agent IDs that workflow journals show as started but not finished.
+///
+/// Workflow runs don't emit `agent_progress` entries in the parent session
+/// JSONL; instead each run journals into
+/// `subagents/workflows/<run-id>/journal.jsonl` with one
+/// `{"type":"started","agentId":...}` line per launched agent and a matching
+/// `{"type":"result",...}` line when it completes.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "internal API, always called with std HashMap"
+)]
+pub fn workflow_active_ids(subagents_dir: &Path) -> HashSet<String> {
+    let mut started = HashSet::new();
+    let mut finished: HashSet<String> = HashSet::new();
+
+    let Ok(runs) = fs::read_dir(subagents_dir.join("workflows")) else {
+        return started;
+    };
+
+    for run in runs.flatten() {
+        let journal = run.path().join("journal.jsonl");
+        let Ok(file) = fs::File::open(&journal) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Some(val) = parse_json_line(&line) else {
+                continue;
+            };
+            let Some(id) = val.get("agentId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match val.get("type").and_then(|v| v.as_str()) {
+                Some("started") => {
+                    started.insert(id.to_string());
+                }
+                Some("result") => {
+                    finished.insert(id.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    started.retain(|id| !finished.contains(id));
+    started
 }
 
 fn parse_subagent(path: &Path) -> Option<SubagentData> {
@@ -78,7 +141,7 @@ fn read_subagent_task(file: &fs::File) -> String {
     if file.seek(SeekFrom::Start(0)).is_err() {
         return String::new();
     }
-    let reader = std::io::BufReader::new(&mut file);
+    let reader = BufReader::new(&mut file);
 
     for line in reader.lines().take(3).map_while(Result::ok) {
         let Some(val) = parse_json_line(&line) else {
@@ -149,7 +212,11 @@ fn read_subagent_usage(file: &fs::File, file_len: u64) -> (ModelShort, u64) {
 }
 
 fn parse_model(model: &str) -> ModelShort {
-    if model.contains("opus") {
+    if model.contains("fable") {
+        ModelShort::Fable
+    } else if model.contains("mythos") {
+        ModelShort::Mythos
+    } else if model.contains("opus") {
         ModelShort::Opus
     } else if model.contains("sonnet") {
         ModelShort::Sonnet
@@ -165,6 +232,16 @@ mod tests {
     use super::*;
     use crate::data::sessions::testutil::write_agent_file;
     use std::path::PathBuf;
+
+    #[test]
+    fn parse_model_fable() {
+        assert_eq!(parse_model("claude-fable-5"), ModelShort::Fable);
+    }
+
+    #[test]
+    fn parse_model_mythos() {
+        assert_eq!(parse_model("claude-mythos-5"), ModelShort::Mythos);
+    }
 
     #[test]
     fn parse_model_opus() {
@@ -221,7 +298,7 @@ mod tests {
 
     #[test]
     fn scan_subagents_nonexistent_dir() {
-        let active: HashSet<String> = ["aaa"].iter().map(|s| (*s).to_string()).collect();
+        let active = HashSet::from(["aaa".to_string()]);
         let agents = scan_subagents(Path::new("/nonexistent/dir/subagents"), &active);
         assert!(agents.is_empty());
     }
@@ -233,9 +310,79 @@ mod tests {
         let path = dir.path().join("acompact-xyz.jsonl");
         fs::write(&path, r#"{"type":"user","message":{"content":"hi"}}"#).unwrap();
 
-        let active: HashSet<String> = ["xyz"].iter().map(|s| (*s).to_string()).collect();
+        let active = HashSet::from(["xyz".to_string()]);
         let agents = scan_subagents(dir.path(), &active);
         assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn scan_subagents_finds_workflow_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("workflows").join("wf_abc123");
+        fs::create_dir_all(&run_dir).unwrap();
+        write_agent_file(&run_dir, "wfagent1", "Verify hypothesis", 2_000);
+
+        let active = HashSet::from(["wfagent1".to_string()]);
+        let agents = scan_subagents(dir.path(), &active);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].task, "Verify hypothesis");
+    }
+
+    #[test]
+    fn scan_subagents_merges_direct_and_workflow_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_file(dir.path(), "direct1", "Direct agent", 1_000);
+        let run_dir = dir.path().join("workflows").join("wf_abc123");
+        fs::create_dir_all(&run_dir).unwrap();
+        write_agent_file(&run_dir, "wfagent1", "Workflow agent", 2_000);
+
+        let active = HashSet::from(["direct1".to_string(), "wfagent1".to_string()]);
+        let agents = scan_subagents(dir.path(), &active);
+        assert_eq!(agents.len(), 2);
+    }
+
+    // ── workflow_active_ids ──────────────────────────────────────
+
+    #[test]
+    fn workflow_active_ids_started_without_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("workflows").join("wf_abc123");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            concat!(
+                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a1\"}\n",
+                "{\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"a1\",\"result\":\"done\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let ids = workflow_active_ids(dir.path());
+        assert_eq!(ids, HashSet::from(["a2".to_string()]));
+    }
+
+    #[test]
+    fn workflow_active_ids_all_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("workflows").join("wf_done");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            concat!(
+                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a1\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"a1\",\"result\":\"ok\"}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(workflow_active_ids(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn workflow_active_ids_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(workflow_active_ids(dir.path()).is_empty());
     }
 
     // ── read_subagent_task prefix stripping ─────────────────────
@@ -407,6 +554,12 @@ mod tests {
                 prefix in "[0-9\\-]{0,10}",
                 suffix in "[0-9\\-]{0,10}",
             ) {
+                let model_fable = format!("{prefix}fable{suffix}");
+                assert_eq!(parse_model(&model_fable), ModelShort::Fable);
+
+                let model_mythos = format!("{prefix}mythos{suffix}");
+                assert_eq!(parse_model(&model_mythos), ModelShort::Mythos);
+
                 let model_opus = format!("{prefix}opus{suffix}");
                 assert_eq!(parse_model(&model_opus), ModelShort::Opus);
 
