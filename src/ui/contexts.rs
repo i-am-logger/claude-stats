@@ -16,11 +16,47 @@ fn contexts_height(sessions: &[SessionData]) -> u16 {
     }
     let mut h: u16 = 2; // header + blank
     for session in sessions {
-        h = h.saturating_add(4); // title + bar + info + state
+        h = h.saturating_add(3); // title + bar + info
+        if has_state_row(session) {
+            h = h.saturating_add(1);
+        }
         h = h.saturating_add(session.agents.len() as u16);
         h = h.saturating_add(1); // spacer
     }
     h
+}
+
+/// Whether the session gets a state row. An empty state row would render as
+/// a second blank line, making inter-session gaps uneven.
+fn has_state_row(session: &SessionData) -> bool {
+    !session.activity.is_empty() || !session.agents.is_empty()
+}
+
+fn format_agent_count(n: usize) -> String {
+    if n == 1 {
+        "1 agent".to_string()
+    } else {
+        format!("{n} agents")
+    }
+}
+
+/// Compact two-unit runtime: "42s", "12m 42s", "1h 4m", "2d 1h".
+fn format_runtime(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn session_indicator(state: SessionState, tick: u64) -> (String, Color) {
@@ -61,7 +97,17 @@ fn state_color(state: SessionState) -> Color {
     }
 }
 
-fn agent_state_display(state: SessionState) -> (&'static str, Color) {
+/// An agent whose transcript has been quiet this long can't honestly claim
+/// active work — render "stale" instead of "working"/"thinking". It stays
+/// listed (it might be mid-long-model-turn) until the liveness rules drop it.
+const AGENT_STALE_DISPLAY_SECS: u64 = 300;
+
+fn agent_state_display(state: SessionState, last_write_age_secs: u64) -> (&'static str, Color) {
+    if last_write_age_secs > AGENT_STALE_DISPLAY_SECS
+        && matches!(state, SessionState::Working | SessionState::Thinking)
+    {
+        return ("stale", DIM);
+    }
     match state {
         SessionState::Thinking => ("thinking", Color::Cyan),
         SessionState::Working => ("working", Color::Green),
@@ -121,7 +167,9 @@ impl Section for ContextsSection<'_> {
             constraints.push(Constraint::Length(1)); // title
             constraints.push(Constraint::Length(1)); // bar
             constraints.push(Constraint::Length(1)); // info
-            constraints.push(Constraint::Length(1)); // state
+            if has_state_row(session) {
+                constraints.push(Constraint::Length(1)); // state
+            }
             for _ in &session.agents {
                 constraints.push(Constraint::Length(1));
             }
@@ -146,14 +194,19 @@ impl Section for ContextsSection<'_> {
         i += 2; // header + blank
 
         for session in self.sessions {
-            let Some(rows) = chunks.get(i..i + 4) else {
+            let Some(rows) = chunks.get(i..i + 3) else {
                 return;
             };
             render_title_row(session, self.tick, frame, rows[0]);
             render_context_bar(session, frame, rows[1]);
             render_info_row(session, frame, rows[2]);
-            render_state_row(session, frame, rows[3]);
-            i += 4;
+            i += 3;
+            if has_state_row(session) {
+                if let Some(&state_area) = chunks.get(i) {
+                    render_state_row(session, frame, state_area);
+                }
+                i += 1;
+            }
             render_agents(&session.agents, frame, &chunks, &mut i);
             i += 1; // spacer
         }
@@ -221,7 +274,7 @@ fn render_state_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
             spans.push(Span::styled(" · ", Style::default().fg(DIM)));
         }
         spans.push(Span::styled(
-            format!("{} agents", session.agents.len()),
+            format_agent_count(session.agents.len()),
             Style::default().fg(Color::Magenta),
         ));
     }
@@ -247,14 +300,31 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
             return;
         };
         let connector = tree_connector(idx + 1 == agents.len());
-        let (a_state, a_color) = agent_state_display(agent.state);
+        let (a_state, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
         let tokens_k = format_agent_tokens_k(agent.context_tokens);
-        let mut spans = vec![
-            Span::styled(connector, Style::default().fg(DIM)),
+        let mut spans = vec![Span::styled(connector, Style::default().fg(DIM))];
+        if let Some(name) = &agent.name {
+            spans.push(Span::styled(
+                format!("{name} "),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.extend([
             Span::styled(agent.model.to_string(), Style::default().fg(Color::Blue)),
             Span::styled(format!(" {tokens_k}"), Style::default().fg(DIM)),
-            Span::styled(format!(" {a_state}"), Style::default().fg(a_color)),
-        ];
+        ]);
+        if let Some(runtime) = agent.runtime_secs {
+            spans.push(Span::styled(
+                format!(" {}", format_runtime(runtime)),
+                Style::default().fg(DIM),
+            ));
+        }
+        spans.push(Span::styled(
+            format!(" {a_state}"),
+            Style::default().fg(a_color),
+        ));
         if !agent.task.is_empty() {
             spans.push(Span::styled(
                 format!(" — {}", agent.task),
@@ -281,8 +351,11 @@ mod tests {
             agents: (0..agents)
                 .map(|_| SubagentData {
                     task: "test".into(),
+                    name: None,
                     model: ModelShort::Sonnet,
                     context_tokens: 5000,
+                    runtime_secs: Some(90),
+                    last_write_age_secs: 0,
                     state: SessionState::Working,
                 })
                 .collect(),
@@ -313,6 +386,14 @@ mod tests {
             contexts_height(&[make_session(2, SessionState::Working)]),
             9
         );
+    }
+
+    #[test]
+    fn contexts_height_idle_session_without_activity_drops_state_row() {
+        let mut session = make_session(0, SessionState::Idle);
+        session.activity = String::new();
+        // 2 (header+blank) + 3 (title+bar+info) + 0 agents + 1 spacer = 6
+        assert_eq!(contexts_height(&[session]), 6);
     }
 
     #[test]
@@ -386,6 +467,36 @@ mod tests {
         assert_eq!(format_agent_tokens_k(5_000), "5.0k");
     }
 
+    #[test]
+    fn format_runtime_seconds() {
+        assert_eq!(format_runtime(42), "42s");
+    }
+
+    #[test]
+    fn format_runtime_minutes() {
+        assert_eq!(format_runtime(762), "12m 42s");
+    }
+
+    #[test]
+    fn format_runtime_hours() {
+        assert_eq!(format_runtime(3840), "1h 4m");
+    }
+
+    #[test]
+    fn format_runtime_days() {
+        assert_eq!(format_runtime(2 * 86_400 + 3600 + 59), "2d 1h");
+    }
+
+    #[test]
+    fn format_agent_count_singular() {
+        assert_eq!(format_agent_count(1), "1 agent");
+    }
+
+    #[test]
+    fn format_agent_count_plural() {
+        assert_eq!(format_agent_count(3), "3 agents");
+    }
+
     // ── state_color ──────────────────────────────────────────
 
     #[test]
@@ -407,23 +518,37 @@ mod tests {
 
     #[test]
     fn agent_state_thinking() {
-        let (label, color) = agent_state_display(SessionState::Thinking);
+        let (label, color) = agent_state_display(SessionState::Thinking, 0);
         assert_eq!(label, "thinking");
         assert_eq!(color, Color::Cyan);
     }
 
     #[test]
     fn agent_state_working() {
-        let (label, color) = agent_state_display(SessionState::Working);
+        let (label, color) = agent_state_display(SessionState::Working, 0);
         assert_eq!(label, "working");
         assert_eq!(color, Color::Green);
     }
 
     #[test]
     fn agent_state_idle() {
-        let (label, color) = agent_state_display(SessionState::Idle);
+        let (label, color) = agent_state_display(SessionState::Idle, 0);
         assert_eq!(label, "idle");
         assert_eq!(color, DIM);
+    }
+
+    #[test]
+    fn agent_state_working_but_quiet_shows_stale() {
+        let (label, color) =
+            agent_state_display(SessionState::Working, AGENT_STALE_DISPLAY_SECS + 1);
+        assert_eq!(label, "stale");
+        assert_eq!(color, DIM);
+    }
+
+    #[test]
+    fn agent_state_idle_never_stale() {
+        let (label, _) = agent_state_display(SessionState::Idle, AGENT_STALE_DISPLAY_SECS + 1);
+        assert_eq!(label, "idle");
     }
 
     // ── tree_connector ───────────────────────────────────────

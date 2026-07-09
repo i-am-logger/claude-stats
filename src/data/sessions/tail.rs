@@ -52,6 +52,48 @@ enum AgentKind {
     Background,
 }
 
+/// Lifecycle status of a named teammate observed in the parent session JSONL.
+///
+/// Teammates (Agent tool with a `name`) never emit `agent_progress` entries;
+/// their lifecycle shows up as a `toolUseResult.status == "teammate_spawned"`
+/// entry on spawn and `<teammate-message>` idle notifications when they go
+/// idle. Idle means "available", not terminated — a teammate can resume via
+/// its mailbox with no new spawn marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TeammateStatus {
+    /// Timestamp of the most recent `teammate_spawned` marker.
+    pub spawned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Timestamp of the most recent idle notification.
+    pub last_idle_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl TeammateStatus {
+    /// Whether the teammate has gone idle since its last spawn.
+    pub fn is_idle(&self) -> bool {
+        match (self.spawned_at, self.last_idle_at) {
+            (Some(spawned), Some(idle)) => idle > spawned,
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Parse the top-level `.timestamp` field of a session entry.
+pub(crate) fn entry_timestamp(val: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let ts = val.get("timestamp")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+/// Extract the teammate name from a `<teammate-message teammate_id="name@team">`
+/// tag inside a message content string.
+fn teammate_name_from_message(content: &str) -> Option<&str> {
+    let attr = content.split_once("teammate_id=\"")?.1;
+    let id = attr.split_once('"')?.0;
+    Some(id.split('@').next().unwrap_or(id))
+}
+
 /// Tracks all subagents observed in a session JSONL.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AgentTracker {
@@ -60,6 +102,8 @@ pub(crate) struct AgentTracker {
     completed_tool_ids: HashSet<String>,
     /// Agent IDs that received a queue-operation completion (background).
     completed_background_ids: HashSet<String>,
+    /// Named teammates keyed by name.
+    teammates: HashMap<String, TeammateStatus>,
 }
 
 impl AgentTracker {
@@ -112,6 +156,30 @@ impl AgentTracker {
                                 .or_insert(AgentKind::Background);
                         }
                     }
+
+                    // toolUseResult with status "teammate_spawned" → named teammate
+                    if tur.get("status").and_then(serde_json::Value::as_str)
+                        == Some("teammate_spawned")
+                    {
+                        if let Some(name) = tur.get("name").and_then(serde_json::Value::as_str) {
+                            let status = self.teammates.entry(name.to_string()).or_default();
+                            status.spawned_at = status.spawned_at.max(entry_timestamp(val));
+                        }
+                    }
+                }
+
+                // A <teammate-message> idle notification marks a teammate idle.
+                // (A teammate-message WITHOUT idle_notification is its report —
+                // informational, not a lifecycle signal.)
+                if let Some(serde_json::Value::String(content)) = val.pointer("/message/content") {
+                    if content.contains("<teammate-message")
+                        && content.contains("idle_notification")
+                    {
+                        if let Some(name) = teammate_name_from_message(content) {
+                            let status = self.teammates.entry(name.to_string()).or_default();
+                            status.last_idle_at = status.last_idle_at.max(entry_timestamp(val));
+                        }
+                    }
                 }
             }
             Some("queue-operation") => {
@@ -153,6 +221,16 @@ impl AgentTracker {
             .extend(other.completed_tool_ids.iter().cloned());
         self.completed_background_ids
             .extend(other.completed_background_ids.iter().cloned());
+        for (name, status) in &other.teammates {
+            let entry = self.teammates.entry(name.clone()).or_default();
+            entry.spawned_at = entry.spawned_at.max(status.spawned_at);
+            entry.last_idle_at = entry.last_idle_at.max(status.last_idle_at);
+        }
+    }
+
+    /// Named teammates observed so far, keyed by name.
+    pub fn teammates(&self) -> &HashMap<String, TeammateStatus> {
+        &self.teammates
     }
 
     /// Return the set of agent IDs that are still active.
@@ -890,6 +968,123 @@ mod tests {
         let mut tracker = AgentTracker::new();
         tracker.process(&val);
         assert!(tracker.completed_background_ids.is_empty());
+    }
+
+    // ── teammate tracking ──────────────────────────────────────────
+
+    fn teammate_spawn_entry(name: &str, ts: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": ts,
+            "toolUseResult": {
+                "status": "teammate_spawned",
+                "name": name,
+                "agent_id": format!("{name}@session-4e9fac7d"),
+                "model": "claude-opus-4-8",
+                "team_name": "session-4e9fac7d"
+            }
+        })
+    }
+
+    fn teammate_idle_entry(name: &str, ts: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": ts,
+            "message": {
+                "content": format!(
+                    "<teammate-message teammate_id=\"{name}@session-4e9fac7d\">{{\"type\":\"idle_notification\",\"from\":\"{name}\"}}</teammate-message>"
+                )
+            }
+        })
+    }
+
+    #[test]
+    fn tracker_teammate_spawn_registers_active() {
+        let mut tracker = AgentTracker::new();
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:48.994Z",
+        ));
+        let status = &tracker.teammates()["fix-docrefs"];
+        assert!(status.spawned_at.is_some());
+        assert!(!status.is_idle());
+    }
+
+    #[test]
+    fn tracker_teammate_idle_after_spawn() {
+        let mut tracker = AgentTracker::new();
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:48.994Z",
+        ));
+        tracker.process(&teammate_idle_entry(
+            "fix-docrefs",
+            "2026-07-09T02:07:22.456Z",
+        ));
+        assert!(tracker.teammates()["fix-docrefs"].is_idle());
+    }
+
+    #[test]
+    fn tracker_teammate_respawn_after_idle_is_active() {
+        let mut tracker = AgentTracker::new();
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:48.994Z",
+        ));
+        tracker.process(&teammate_idle_entry(
+            "fix-docrefs",
+            "2026-07-09T02:07:22.456Z",
+        ));
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:10:00.000Z",
+        ));
+        assert!(!tracker.teammates()["fix-docrefs"].is_idle());
+    }
+
+    #[test]
+    fn tracker_teammate_report_message_is_not_idle() {
+        let val = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-07-09T02:05:00.000Z",
+            "message": {
+                "content": "<teammate-message teammate_id=\"fix-docrefs@team\" summary=\"progress report\">done with step 1</teammate-message>"
+            }
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:48.994Z",
+        ));
+        tracker.process(&val);
+        assert!(!tracker.teammates()["fix-docrefs"].is_idle());
+    }
+
+    #[test]
+    fn tracker_teammate_merge_keeps_latest_timestamps() {
+        let mut a = AgentTracker::new();
+        a.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:48.994Z",
+        ));
+        let mut b = AgentTracker::new();
+        b.process(&teammate_idle_entry(
+            "fix-docrefs",
+            "2026-07-09T02:07:22.456Z",
+        ));
+        a.merge(&b);
+        assert!(a.teammates()["fix-docrefs"].is_idle());
+    }
+
+    #[test]
+    fn teammate_name_parsed_from_message_tag() {
+        assert_eq!(
+            teammate_name_from_message(
+                "<teammate-message teammate_id=\"fix-docrefs@session-4e9fac7d\" ...>"
+            ),
+            Some("fix-docrefs")
+        );
+        assert_eq!(teammate_name_from_message("no tag here"), None);
     }
 
     // ── seek_tail ──────────────────────────────────────────────────

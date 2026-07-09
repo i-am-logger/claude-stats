@@ -266,7 +266,12 @@ impl SessionCache {
         // Workflow-spawned agents track via per-run journals, not the parent
         // session JSONL.
         active_ids.extend(subagents::workflow_active_ids(&subagents_dir));
-        let agents = subagents::scan_subagents(&subagents_dir, &active_ids);
+        let teammates = self
+            .entries
+            .get(path)
+            .map(|cached| cached.tracker.teammates().clone())
+            .unwrap_or_default();
+        let agents = subagents::scan_subagents(&subagents_dir, &active_ids, &teammates);
 
         let context_window = tail::context_window_for_model(&sfr.model);
         let context_percent = ((sfr.last_tokens.min(context_window) * 100) / context_window) as u16;
