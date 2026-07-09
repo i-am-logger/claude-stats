@@ -37,7 +37,11 @@ pub(crate) fn spawn(tx: EventTx) -> tokio::task::JoinHandle<()> {
             }
             // Watcher events give sub-second latency; the heartbeat keeps
             // process liveness and activity labels honest between events.
-            let should_scan = heartbeat || (has_watcher && dirty.swap(false, Ordering::AcqRel));
+            // Read-and-clear dirty unconditionally so a heartbeat scan also
+            // consumes a pending watcher event instead of leaving it to
+            // trigger a redundant rescan next tick.
+            let dirty_seen = has_watcher && dirty.swap(false, Ordering::AcqRel);
+            let should_scan = heartbeat || dirty_seen;
 
             if should_scan {
                 let (data, returned_cache) = {
