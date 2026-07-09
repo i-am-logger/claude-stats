@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.5](https://github.com/i-am-logger/claude-stats/compare/v1.5.4...v1.5.5) (2026-07-09)
+
+
+### Bug Fixes
+
+* restore active-context detection, Claude 5 context windows, workflow subagents ([#18](https://github.com/i-am-logger/claude-stats/issues/18)) ([bf81e56](https://github.com/i-am-logger/claude-stats/commit/bf81e56709ecd99f551153381515a53323884a08))
+
 ## [1.5.4](https://github.com/i-am-logger/claude-stats/compare/v1.5.3...v1.5.4) (2026-03-21)
 
 
