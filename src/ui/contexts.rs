@@ -270,7 +270,7 @@ fn render_info_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
         ));
     }
     spans.push(Span::styled(
-        format!("  {}", &session.last_activity_label),
+        format!("  {}", session.last_activity_label),
         Style::default().fg(DIM),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), indented(area));
