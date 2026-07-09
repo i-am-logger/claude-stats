@@ -266,12 +266,18 @@ impl SessionCache {
         let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
         let active_ids = self.update_agent_tracking(path);
-        let teammates = self
+        let (completed_tool_ids, teammates) = self
             .entries
             .get(path)
-            .map(|cached| cached.tracker.teammates().clone())
+            .map(|cached| {
+                (
+                    cached.tracker.completed_tool_ids().clone(),
+                    cached.tracker.teammates().clone(),
+                )
+            })
             .unwrap_or_default();
-        let agents = subagents::scan_subagents(&subagents_dir, &active_ids, &teammates);
+        let agents =
+            subagents::scan_subagents(&subagents_dir, &active_ids, &completed_tool_ids, &teammates);
 
         let context_window = tail::context_window_for_model(&sfr.model);
         let context_percent = ((sfr.last_tokens.min(context_window) * 100) / context_window) as u16;

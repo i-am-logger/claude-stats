@@ -65,6 +65,8 @@ pub struct TeammateStatus {
     pub spawned_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Timestamp of the most recent idle notification.
     pub last_idle_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A `teammate_terminated` frame was seen — the teammate shut down.
+    pub terminated: bool,
 }
 
 impl TeammateStatus {
@@ -92,6 +94,24 @@ fn teammate_name_from_message(content: &str) -> Option<&str> {
     let attr = content.split_once("teammate_id=\"")?.1;
     let id = attr.split_once('"')?.0;
     Some(id.split('@').next().unwrap_or(id))
+}
+
+/// Extract the `"timestamp":"..."` embedded in a teammate notification body.
+fn embedded_timestamp(content: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let after = content.split_once("\"timestamp\":\"")?.1;
+    let ts = after.split_once('"')?.0;
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+/// Extract the teammate name from a `teammate_terminated` frame — its
+/// message reads `"<name> has shut down. ..."`.
+fn terminated_teammate_name(content: &str) -> Option<String> {
+    let msg = content.split_once("\"message\":\"")?.1;
+    let msg = msg.split_once('"')?.0;
+    let name = msg.split_whitespace().next()?;
+    msg.contains("has shut down").then(|| name.to_string())
 }
 
 /// Tracks all subagents observed in a session JSONL.
@@ -194,7 +214,7 @@ impl AgentTracker {
                 }
                 if let Some(content) = val.get("content").and_then(|c| c.as_str()) {
                     let mut task_id = None;
-                    let mut completed = false;
+                    let mut terminal = false;
                     for line in content.lines() {
                         let line = line.trim();
                         if let Some(id) = line
@@ -203,11 +223,19 @@ impl AgentTracker {
                         {
                             task_id = Some(id);
                         }
-                        if line == "<status>completed</status>" {
-                            completed = true;
+                        // Task-notification statuses mirror the registry's
+                        // terminal states — a failed or user-stopped agent is
+                        // just as finished as a completed one.
+                        if let Some(status) = line
+                            .strip_prefix("<status>")
+                            .and_then(|s| s.strip_suffix("</status>"))
+                        {
+                            if matches!(status, "completed" | "failed" | "killed") {
+                                terminal = true;
+                            }
                         }
                     }
-                    if let (true, Some(id)) = (completed, task_id) {
+                    if let (true, Some(id)) = (terminal, task_id) {
                         self.completed_background_ids.insert(id.to_string());
                     }
                 }
@@ -231,6 +259,7 @@ impl AgentTracker {
             let entry = self.teammates.entry(name.clone()).or_default();
             entry.spawned_at = entry.spawned_at.max(status.spawned_at);
             entry.last_idle_at = entry.last_idle_at.max(status.last_idle_at);
+            entry.terminated = entry.terminated || status.terminated;
         }
     }
 
@@ -239,12 +268,32 @@ impl AgentTracker {
         &self.teammates
     }
 
-    /// Record an idle notification if `content` is a teammate idle message.
+    /// Tool-use ids that already received a `tool_result` — used to detect
+    /// finished synchronous subagents via their meta.json `toolUseId`.
+    pub fn completed_tool_ids(&self) -> &HashSet<String> {
+        &self.completed_tool_ids
+    }
+
+    /// Record teammate lifecycle frames carried in a teammate message. The
+    /// exact JSON markers avoid false positives from reports that merely
+    /// mention them in prose.
     fn note_teammate_idle(&mut self, content: &str, val: &serde_json::Value) {
-        if content.contains("<teammate-message") && content.contains("idle_notification") {
+        if !content.contains("<teammate-message") {
+            return;
+        }
+        if content.contains("\"type\":\"idle_notification\"") {
             if let Some(name) = teammate_name_from_message(content) {
+                // Prefer the notification's embedded timestamp — delivery to
+                // the parent JSONL can lag minutes behind the actual idle.
+                let ts = embedded_timestamp(content).or_else(|| entry_timestamp(val));
                 let status = self.teammates.entry(name.to_string()).or_default();
-                status.last_idle_at = status.last_idle_at.max(entry_timestamp(val));
+                status.last_idle_at = status.last_idle_at.max(ts);
+            }
+        }
+        // "X has shut down" — the only explicit termination frame.
+        if content.contains("\"type\":\"teammate_terminated\"") {
+            if let Some(name) = terminated_teammate_name(content) {
+                self.teammates.entry(name).or_default().terminated = true;
             }
         }
     }
@@ -1097,6 +1146,48 @@ mod tests {
         ));
         a.merge(&b);
         assert!(a.teammates()["fix-docrefs"].is_idle());
+    }
+
+    #[test]
+    fn tracker_teammate_terminated_frame() {
+        let val = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-07-09T02:10:00.000Z",
+            "message": {
+                "content": "<teammate-message teammate_id=\"system@team\">{\"type\":\"teammate_terminated\",\"message\":\"fix-docrefs has shut down. 0 task(s) were unassigned\"}</teammate-message>"
+            }
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&teammate_spawn_entry(
+            "fix-docrefs",
+            "2026-07-09T02:00:48.994Z",
+        ));
+        tracker.process(&val);
+        assert!(tracker.teammates()["fix-docrefs"].terminated);
+    }
+
+    #[test]
+    fn tracker_background_failed_status_is_terminal() {
+        let val = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "<task-notification>\n<task-id>bg_abc</task-id>\n<status>failed</status>\n</task-notification>"
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.completed_background_ids.contains("bg_abc"));
+    }
+
+    #[test]
+    fn tracker_background_killed_status_is_terminal() {
+        let val = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "<task-notification>\n<task-id>bg_abc</task-id>\n<status>killed</status>\n</task-notification>"
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.completed_background_ids.contains("bg_abc"));
     }
 
     #[test]

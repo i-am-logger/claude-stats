@@ -32,12 +32,25 @@ fn has_state_row(session: &SessionData) -> bool {
     !session.activity.is_empty() || !session.agents.is_empty()
 }
 
-fn format_agent_count(n: usize) -> String {
-    if n == 1 {
-        "1 agent".to_string()
-    } else {
-        format!("{n} agents")
+/// Roster summary distinguishing plain agents from aggregated workflow
+/// runs: "2 agents", "1 workflow", "1 agent · 2 workflows".
+fn format_roster_count(agents: &[SubagentData]) -> String {
+    let workflows = agents.iter().filter(|a| a.progress.is_some()).count();
+    let plain = agents.len() - workflows;
+    let mut parts = Vec::new();
+    if plain > 0 {
+        parts.push(format!(
+            "{plain} agent{}",
+            if plain == 1 { "" } else { "s" }
+        ));
     }
+    if workflows > 0 {
+        parts.push(format!(
+            "{workflows} workflow{}",
+            if workflows == 1 { "" } else { "s" }
+        ));
+    }
+    parts.join(" · ")
 }
 
 /// Compact two-unit runtime: "42s", "12m 42s", "1h 4m", "2d 1h".
@@ -274,7 +287,7 @@ fn render_state_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
             spans.push(Span::styled(" · ", Style::default().fg(DIM)));
         }
         spans.push(Span::styled(
-            format_agent_count(session.agents.len()),
+            format_roster_count(&session.agents),
             Style::default().fg(Color::Magenta),
         ));
     }
@@ -502,14 +515,50 @@ mod tests {
         assert_eq!(format_runtime(2 * 86_400 + 3600 + 59), "2d 1h");
     }
 
-    #[test]
-    fn format_agent_count_singular() {
-        assert_eq!(format_agent_count(1), "1 agent");
+    fn agent_row(progress: Option<(u32, u32)>) -> SubagentData {
+        SubagentData {
+            task: "test".into(),
+            name: None,
+            model: ModelShort::Sonnet,
+            context_tokens: 5000,
+            runtime_secs: Some(90),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress,
+        }
     }
 
     #[test]
-    fn format_agent_count_plural() {
-        assert_eq!(format_agent_count(3), "3 agents");
+    fn roster_count_agents_only() {
+        assert_eq!(format_roster_count(&[agent_row(None)]), "1 agent");
+        assert_eq!(
+            format_roster_count(&[agent_row(None), agent_row(None)]),
+            "2 agents"
+        );
+    }
+
+    #[test]
+    fn roster_count_workflows_only() {
+        assert_eq!(
+            format_roster_count(&[agent_row(Some((0, 2))), agent_row(Some((1, 4)))]),
+            "2 workflows"
+        );
+        assert_eq!(
+            format_roster_count(&[agent_row(Some((0, 2)))]),
+            "1 workflow"
+        );
+    }
+
+    #[test]
+    fn roster_count_mixed() {
+        assert_eq!(
+            format_roster_count(&[
+                agent_row(None),
+                agent_row(Some((0, 2))),
+                agent_row(Some((1, 4)))
+            ]),
+            "1 agent · 2 workflows"
+        );
     }
 
     // ── state_color ──────────────────────────────────────────

@@ -21,22 +21,25 @@ use std::path::Path;
 /// observed in practice are stale by many hours.
 pub(crate) const AGENT_STALE_SECS: u64 = 1800;
 
-/// Hide idle teammates once their transcript has been quiet this long. An
-/// idle teammate is "available" (it can be resumed via its mailbox), so it
-/// stays on the roster briefly, then drops off.
-pub(crate) const TEAMMATE_IDLE_HIDE_SECS: u64 = 900;
+/// Hide idle teammates once their transcript has been quiet this long.
+/// Claude Code evicts an idle teammate from its roster after a 30s grace
+/// (`evictAfter = now + 30_000` in its team UI); the transcript mtime is the
+/// idle clock — the idle notification's delivery to the parent JSONL can lag
+/// minutes behind. Hiding is recomputed every scan, so a teammate resumed
+/// via its mailbox writes again and reappears immediately.
+pub(crate) const TEAMMATE_IDLE_HIDE_SECS: u64 = 30;
 
 /// How long a finished workflow run ("N/N agents done") lingers on the
-/// roster after its last write before disappearing.
-pub(crate) const RUN_DONE_LINGER_SECS: u64 = 120;
+/// roster before disappearing — Claude Code evicts terminal rows after 30s.
+pub(crate) const RUN_DONE_LINGER_SECS: u64 = 30;
 
 /// Scan subagent JSONL files and return data for agents that are still active.
 ///
-/// `active_ids` is the set of Task-tool agent IDs (e.g.
-/// `"a2a043d116fbd87f0"`) that parent-JSONL tracking shows as still
-/// in-progress. `teammates` maps named-teammate lifecycle statuses observed
-/// in the parent JSONL; their transcripts are matched by the name embedded
-/// in the filename (`agent-a<name>-<hash>.jsonl`). Workflow runs under
+/// `active_ids` is the set of background agent IDs that parent-JSONL
+/// tracking shows as still in-progress; `completed_tool_ids` are `tool_use`
+/// ids with a `tool_result` (finishing synchronous agents, joined via their
+/// meta.json `toolUseId`). `teammates` maps named-teammate lifecycle
+/// statuses observed in the parent JSONL. Workflow runs under
 /// `subagents/workflows/<run-id>/` aggregate into a single row each.
 #[allow(
     clippy::implicit_hasher,
@@ -45,13 +48,10 @@ pub(crate) const RUN_DONE_LINGER_SECS: u64 = 120;
 pub fn scan_subagents(
     subagents_dir: &Path,
     active_ids: &HashSet<String>,
+    completed_tool_ids: &HashSet<String>,
     teammates: &HashMap<String, TeammateStatus>,
 ) -> Vec<SubagentData> {
-    let mut agents = if active_ids.is_empty() && teammates.is_empty() {
-        Vec::new()
-    } else {
-        collect_agents(subagents_dir, active_ids, teammates)
-    };
+    let mut agents = collect_agents(subagents_dir, active_ids, completed_tool_ids, teammates);
 
     agents.extend(scan_workflow_runs(subagents_dir));
 
@@ -88,6 +88,7 @@ fn dedup_teammates(agents: &mut Vec<SubagentData>) {
 fn collect_agents(
     dir: &Path,
     active_ids: &HashSet<String>,
+    completed_tool_ids: &HashSet<String>,
     teammates: &HashMap<String, TeammateStatus>,
 ) -> Vec<SubagentData> {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -104,16 +105,41 @@ fn collect_agents(
             let name = path.file_stem()?.to_str()?;
             // Extract agent ID from filename: "agent-a2a043d116fbd87f0" → "a2a043d116fbd87f0"
             let agent_id = name.strip_prefix("agent-")?;
+            let meta = read_meta(&path);
 
-            // Task-tool agents confirmed active by id
-            if active_ids.contains(agent_id) {
-                return parse_subagent(&path);
+            // Named teammates: meta taskKind is authoritative; the id shape
+            // (a<name>-<hash>) is the fallback for meta-less transcripts.
+            let is_teammate =
+                meta.as_ref().and_then(|m| m.task_kind.as_deref()) == Some("in_process_teammate");
+            let fallback_name = teammate_name_of(agent_id);
+            if is_teammate || fallback_name.is_some_and(|n| teammates.contains_key(n)) {
+                let tm_name = meta
+                    .as_ref()
+                    .and_then(|m| m.name.clone())
+                    .or_else(|| fallback_name.map(String::from))?;
+                let status = teammates.get(&tm_name).copied().unwrap_or_default();
+                return parse_teammate(&path, &tm_name, &status);
             }
 
-            // Named teammates: the transcript id embeds the name
-            let tm_name = teammate_name_of(agent_id)?;
-            let status = teammates.get(tm_name)?;
-            parse_teammate(&path, tm_name, status)
+            // Background agents tracked via async_launched/task-notification
+            if active_ids.contains(agent_id) {
+                return parse_subagent(&path).map(|(data, _)| data);
+            }
+
+            // Synchronous agents write no persisted progress entries — they
+            // are active while their spawning tool_use has no tool_result in
+            // the parent JSONL and they weren't stopped by the user.
+            let meta = meta?;
+            if meta.stopped_by_user == Some(true) {
+                return None;
+            }
+            let tool_use_id = meta.tool_use_id.as_deref()?;
+            if completed_tool_ids.contains(tool_use_id) {
+                return None;
+            }
+            let (data, _) = parse_subagent(&path)?;
+            // Crashed parents leave no completion marker — cap by staleness.
+            (data.last_write_age_secs <= AGENT_STALE_SECS).then_some(data)
         })
         .collect()
 }
@@ -130,7 +156,26 @@ fn teammate_name_of(agent_id: &str) -> Option<&str> {
 }
 
 fn parse_teammate(path: &Path, name: &str, status: &TeammateStatus) -> Option<SubagentData> {
-    let mut data = parse_subagent(path)?;
+    // An explicit "X has shut down" frame ends the roster row immediately.
+    if status.terminated {
+        return None;
+    }
+
+    let (mut data, last_user_ts) = parse_subagent(path)?;
+
+    // Any termination path (kill, graceful shutdown, spawn-failure rollback)
+    // removes the member from the team config; normal never-shut-down
+    // completion does not. Removals are best-effort — a crashed session
+    // leaves stale members — so absence means terminated, but presence does
+    // NOT mean alive.
+    let membership = read_meta(path)
+        .and_then(|m| m.team_name)
+        .and_then(|team| default_teams_dir().map(|dir| team_membership(&dir, &team, name)))
+        .unwrap_or(TeamMembership::Unknown);
+    if matches!(membership, TeamMembership::Absent) {
+        return None;
+    }
+
     if status.is_idle() {
         // Idle means "available", not terminated — keep the roster row while
         // the transcript is fresh, drop it once it goes quiet.
@@ -145,6 +190,21 @@ fn parse_teammate(path: &Path, name: &str, status: &TeammateStatus) -> Option<Su
     }
     // The meta.json name wins, but the tracker name fills any gap.
     data.name.get_or_insert_with(|| name.to_string());
+    // Claude Code's roster shows time-in-current-turn: elapsed since the last
+    // user entry in the teammate transcript (a mailbox message starts a new
+    // turn). Spawn-time joinedAt is the fallback.
+    let turn_start = last_user_ts.or(match membership {
+        TeamMembership::Member(joined) => joined,
+        _ => None,
+    });
+    if let Some(start) = turn_start {
+        data.runtime_secs = Some(
+            (chrono::Utc::now() - start)
+                .num_seconds()
+                .max(0)
+                .cast_unsigned(),
+        );
+    }
     Some(data)
 }
 
@@ -182,23 +242,41 @@ fn scan_workflow_runs(subagents_dir: &Path) -> Vec<SubagentData> {
         .collect()
 }
 
+/// Run snapshot written to `<session>/workflows/<run-id>.json` when a
+/// workflow finishes — the exact terminal signal (journals can't record
+/// failures: `result` lines are only written for non-null results).
+#[derive(Debug, serde::Deserialize)]
+struct RunSnapshot {
+    status: Option<String>,
+    #[serde(rename = "workflowName")]
+    workflow_name: Option<String>,
+    #[serde(rename = "totalTokens")]
+    total_tokens: Option<u64>,
+}
+
 fn parse_workflow_run(run_dir: &Path, scripts_dir: Option<&Path>) -> Option<SubagentData> {
     let journal = fs::File::open(run_dir.join("journal.jsonl")).ok()?;
+    // Count by cache KEY, not agentId: stall/throttle respawns append extra
+    // started lines with new agentIds for the same key.
     let mut started: HashSet<String> = HashSet::new();
     let mut finished: HashSet<String> = HashSet::new();
     for line in BufReader::new(journal).lines().map_while(Result::ok) {
         let Some(val) = parse_json_line(&line) else {
             continue;
         };
-        let Some(id) = val.get("agentId").and_then(|v| v.as_str()) else {
+        let Some(key) = val
+            .get("key")
+            .or_else(|| val.get("agentId"))
+            .and_then(|v| v.as_str())
+        else {
             continue;
         };
         match val.get("type").and_then(|v| v.as_str()) {
             Some("started") => {
-                started.insert(id.to_string());
+                started.insert(key.to_string());
             }
             Some("result") => {
-                finished.insert(id.to_string());
+                finished.insert(key.to_string());
             }
             _ => {}
         }
@@ -207,11 +285,70 @@ fn parse_workflow_run(run_dir: &Path, scripts_dir: Option<&Path>) -> Option<Suba
         return None;
     }
     let total = started.len() as u32;
-    let done = started.iter().filter(|id| finished.contains(*id)).count() as u32;
+    let done = started.iter().filter(|key| finished.contains(*key)).count() as u32;
 
-    // Aggregate the run's agent transcripts: summed tokens, earliest start,
-    // freshest write.
-    let mut context_tokens: u64 = 0;
+    // The completion snapshot is authoritative for terminal runs (it also
+    // catches failed runs whose journal keys dangle as started forever).
+    let run_id = run_dir.file_name().and_then(|n| n.to_str())?;
+    let snapshot_path = run_dir
+        .parent() // .../subagents/workflows
+        .and_then(Path::parent) // .../subagents
+        .and_then(Path::parent) // <session dir>
+        .map(|session| session.join("workflows").join(format!("{run_id}.json")));
+    let snapshot = snapshot_path.as_ref().and_then(|p| read_run_snapshot(p));
+    let snapshot_age = snapshot_path.as_ref().and_then(|p| file_age_secs(p));
+
+    let run_stats = aggregate_run_transcripts(run_dir);
+    let (total_tokens, started_at, last_write_age_secs) = run_stats;
+
+    let terminal = snapshot.is_some() || done >= total;
+    if terminal {
+        // A finished run lingers briefly (Claude Code evicts terminal rows
+        // after 30s), anchored to the snapshot when it exists.
+        let terminal_age = snapshot_age.unwrap_or(last_write_age_secs);
+        if terminal_age > RUN_DONE_LINGER_SECS {
+            return None;
+        }
+    }
+
+    let runtime_secs = started_at.map(|t| {
+        (chrono::Utc::now() - t)
+            .num_seconds()
+            .max(0)
+            .cast_unsigned()
+    });
+
+    let snapshot_name = snapshot.as_ref().and_then(|s| s.workflow_name.clone());
+    let snapshot_tokens = snapshot.as_ref().and_then(|s| s.total_tokens);
+    let failed = snapshot
+        .as_ref()
+        .and_then(|s| s.status.as_deref())
+        .is_some_and(|s| s == "failed");
+
+    Some(SubagentData {
+        task: if failed {
+            "failed".to_string()
+        } else {
+            String::new()
+        },
+        name: Some(snapshot_name.unwrap_or_else(|| workflow_run_name(run_dir, scripts_dir))),
+        model: ModelShort::Unknown,
+        context_tokens: snapshot_tokens.unwrap_or(total_tokens),
+        runtime_secs,
+        last_write_age_secs,
+        state: if terminal {
+            SessionState::Idle
+        } else {
+            SessionState::Working
+        },
+        progress: Some((done, total)),
+    })
+}
+
+/// Aggregate a run's agent transcripts: summed tokens (context + output,
+/// matching Claude Code's `totalTokens`), earliest start, freshest write age.
+fn aggregate_run_transcripts(run_dir: &Path) -> (u64, Option<chrono::DateTime<chrono::Utc>>, u64) {
+    let mut total_tokens: u64 = 0;
     let mut started_at: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut last_write_age_secs = u64::MAX;
     if let Ok(entries) = fs::read_dir(run_dir) {
@@ -242,41 +379,26 @@ fn parse_workflow_run(run_dir: &Path, scripts_dir: Option<&Path>) -> Option<Suba
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            let (_, tokens) = read_subagent_usage(&file, metadata.len());
-            context_tokens += tokens;
+            let stats = read_subagent_usage(&file, metadata.len());
+            total_tokens += stats.context_tokens + stats.last_output_tokens;
         }
     }
     if last_write_age_secs == u64::MAX {
         last_write_age_secs = 0;
     }
+    (total_tokens, started_at, last_write_age_secs)
+}
 
-    let running = done < total;
-    // A finished run lingers briefly, then drops off the roster.
-    if !running && last_write_age_secs > RUN_DONE_LINGER_SECS {
-        return None;
-    }
+fn read_run_snapshot(path: &Path) -> Option<RunSnapshot> {
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
 
-    let runtime_secs = started_at.map(|t| {
-        (chrono::Utc::now() - t)
-            .num_seconds()
-            .max(0)
-            .cast_unsigned()
-    });
-
-    Some(SubagentData {
-        task: String::new(),
-        name: Some(workflow_run_name(run_dir, scripts_dir)),
-        model: ModelShort::Unknown,
-        context_tokens,
-        runtime_secs,
-        last_write_age_secs,
-        state: if running {
-            SessionState::Working
-        } else {
-            SessionState::Idle
-        },
-        progress: Some((done, total)),
-    })
+/// Seconds since `path` was last modified; `None` if unreadable. A future
+/// mtime (clock skew) counts as just written.
+fn file_age_secs(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.elapsed().map_or(0, |age| age.as_secs()))
 }
 
 /// Resolve a workflow run's human name from its persisted script:
@@ -320,12 +442,73 @@ fn dir_recently_written(dir: &Path, max_age_secs: u64) -> bool {
 }
 
 /// Sidecar metadata Claude Code writes next to agent transcripts
-/// (`agent-<id>.meta.json`). Present for teammates; name is optional for
-/// anonymous Task-tool agents.
+/// (`agent-<id>.meta.json`). `taskKind == "in_process_teammate"` is the
+/// authoritative teammate discriminator; `toolUseId` joins a synchronous
+/// agent to its spawning `tool_use` in the parent JSONL.
 #[derive(Debug, serde::Deserialize)]
 struct AgentMeta {
     name: Option<String>,
     description: Option<String>,
+    #[serde(rename = "teamName")]
+    team_name: Option<String>,
+    #[serde(rename = "taskKind")]
+    task_kind: Option<String>,
+    #[serde(rename = "toolUseId")]
+    tool_use_id: Option<String>,
+    #[serde(rename = "stoppedByUser")]
+    stopped_by_user: Option<bool>,
+}
+
+/// Persistent team state written by Claude Code
+/// (`~/.claude/teams/<team>/config.json`). Members accumulate — presence
+/// does NOT mean alive — but `joinedAt` is the roster runtime Claude Code
+/// itself displays.
+#[derive(Debug, serde::Deserialize)]
+struct TeamConfig {
+    #[serde(default)]
+    members: Vec<TeamMember>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TeamMember {
+    name: String,
+    #[serde(rename = "joinedAt")]
+    joined_at: Option<i64>,
+}
+
+fn default_teams_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|home| home.join(".claude").join("teams"))
+}
+
+/// A teammate's standing in its team config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamMembership {
+    /// Config readable and the member is present (with `joinedAt` if known).
+    /// Presence does NOT mean alive — removals are best-effort.
+    Member(Option<chrono::DateTime<chrono::Utc>>),
+    /// Config readable but the member is absent — terminated (kill, graceful
+    /// shutdown, and spawn-failure rollback all remove the member).
+    Absent,
+    /// Config missing or unreadable — no signal (session-end cleanup removes
+    /// the whole team dir).
+    Unknown,
+}
+
+fn team_membership(teams_dir: &Path, team: &str, name: &str) -> TeamMembership {
+    let Ok(data) = fs::read_to_string(teams_dir.join(team).join("config.json")) else {
+        return TeamMembership::Unknown;
+    };
+    let Ok(config) = serde_json::from_str::<TeamConfig>(&data) else {
+        return TeamMembership::Unknown;
+    };
+    match config.members.into_iter().find(|m| m.name == name) {
+        Some(member) => TeamMembership::Member(
+            member
+                .joined_at
+                .and_then(chrono::DateTime::from_timestamp_millis),
+        ),
+        None => TeamMembership::Absent,
+    }
 }
 
 fn read_meta(jsonl_path: &Path) -> Option<AgentMeta> {
@@ -334,7 +517,9 @@ fn read_meta(jsonl_path: &Path) -> Option<AgentMeta> {
     serde_json::from_str(&data).ok()
 }
 
-fn parse_subagent(path: &Path) -> Option<SubagentData> {
+/// Parse an agent transcript. The second value is the timestamp of the last
+/// user entry in the tail window — a teammate's current turn start.
+fn parse_subagent(path: &Path) -> Option<(SubagentData, Option<chrono::DateTime<chrono::Utc>>)> {
     let file = fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     let file_len = metadata.len();
@@ -363,20 +548,23 @@ fn parse_subagent(path: &Path) -> Option<SubagentData> {
     // heuristic is the fallback (it may be the raw prompt).
     let task = description.map_or(task, |d| truncate_str(d.trim(), 60));
 
-    let (model, context_tokens) = read_subagent_usage(&file, file_len);
+    let tail_stats = read_subagent_usage(&file, file_len);
 
     let state = detect_state_from_tail(&file, file_len);
 
-    Some(SubagentData {
-        task,
-        name,
-        model,
-        context_tokens,
-        runtime_secs,
-        last_write_age_secs,
-        state,
-        progress: None,
-    })
+    Some((
+        SubagentData {
+            task,
+            name,
+            model: tail_stats.model,
+            context_tokens: tail_stats.context_tokens,
+            runtime_secs,
+            last_write_age_secs,
+            state,
+            progress: None,
+        },
+        tail_stats.last_user_ts,
+    ))
 }
 
 /// Read the agent's task title and start timestamp from the first lines of
@@ -434,34 +622,52 @@ fn read_subagent_head(file: &fs::File) -> (String, Option<chrono::DateTime<chron
     (task, started_at)
 }
 
-fn read_subagent_usage(file: &fs::File, file_len: u64) -> (ModelShort, u64) {
+/// Usage stats scanned from a transcript's tail window.
+#[derive(Debug, Default)]
+struct TailStats {
+    model: ModelShort,
+    /// Context size from the latest assistant usage (input + cache fields).
+    context_tokens: u64,
+    /// `output_tokens` of the latest assistant usage.
+    last_output_tokens: u64,
+    /// Timestamp of the last user entry — a teammate's current turn start.
+    last_user_ts: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn read_subagent_usage(file: &fs::File, file_len: u64) -> TailStats {
     let seek_pos = file_len.saturating_sub(super::RECENT_TAIL_BYTES);
     let Some(reader) = seek_tail(file, seek_pos) else {
-        return (ModelShort::Unknown, 0);
+        return TailStats::default();
     };
 
-    let mut model = ModelShort::Unknown;
-    let mut tokens: u64 = 0;
+    let mut stats = TailStats::default();
 
     for line in reader.lines().map_while(Result::ok) {
         let Some(val) = parse_json_line(&line) else {
             continue;
         };
+        if val.get("type").and_then(|t| t.as_str()) == Some("user") {
+            stats.last_user_ts = entry_timestamp(&val).or(stats.last_user_ts);
+        }
         if !is_assistant_usage(&val) {
             continue;
         }
         if let Some(usage) = val.pointer("/message/usage") {
             let total = extract_tokens(usage);
             if total > 0 {
-                tokens = total;
+                stats.context_tokens = total;
+                stats.last_output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
             }
         }
         if let Some(m) = val.pointer("/message/model").and_then(|v| v.as_str()) {
-            model = parse_model(m);
+            stats.model = parse_model(m);
         }
     }
 
-    (model, tokens)
+    stats
 }
 
 fn parse_model(model: &str) -> ModelShort {
@@ -531,7 +737,7 @@ mod tests {
         write_agent_file(dir.path(), "ccc", "Task C", 1000);
 
         let active: HashSet<String> = ["aaa", "ccc"].iter().map(|s| (*s).to_string()).collect();
-        let agents = scan_subagents(dir.path(), &active, &HashMap::new());
+        let agents = scan_subagents(dir.path(), &active, &HashSet::new(), &HashMap::new());
         assert_eq!(agents.len(), 2);
         let tasks: Vec<&str> = agents.iter().map(|a| a.task.as_str()).collect();
         assert!(tasks.contains(&"Task A"));
@@ -545,7 +751,7 @@ mod tests {
         write_agent_file(dir.path(), "aaa", "Task A", 1000);
 
         let active: HashSet<String> = HashSet::new();
-        let agents = scan_subagents(dir.path(), &active, &HashMap::new());
+        let agents = scan_subagents(dir.path(), &active, &HashSet::new(), &HashMap::new());
         assert!(agents.is_empty());
     }
 
@@ -555,6 +761,7 @@ mod tests {
         let agents = scan_subagents(
             Path::new("/nonexistent/dir/subagents"),
             &active,
+            &HashSet::new(),
             &HashMap::new(),
         );
         assert!(agents.is_empty());
@@ -568,7 +775,7 @@ mod tests {
         fs::write(&path, r#"{"type":"user","message":{"content":"hi"}}"#).unwrap();
 
         let active = HashSet::from(["xyz".to_string()]);
-        let agents = scan_subagents(dir.path(), &active, &HashMap::new());
+        let agents = scan_subagents(dir.path(), &active, &HashSet::new(), &HashMap::new());
         assert!(agents.is_empty());
     }
 
@@ -602,7 +809,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_workflow_run(dir.path(), "wf_abc123");
 
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 1);
         let run = &agents[0];
         assert_eq!(run.progress, Some((1, 2)));
@@ -622,7 +834,12 @@ mod tests {
         fs::create_dir_all(&scripts).unwrap();
         fs::write(scripts.join("my-flow-wf_abc123.js"), "export const meta").unwrap();
 
-        let agents = scan_subagents(&subagents_dir, &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            &subagents_dir,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-flow"));
     }
@@ -634,7 +851,7 @@ mod tests {
         write_workflow_run(dir.path(), "wf_abc123");
 
         let active = HashSet::from(["direct1".to_string()]);
-        let agents = scan_subagents(dir.path(), &active, &HashMap::new());
+        let agents = scan_subagents(dir.path(), &active, &HashSet::new(), &HashMap::new());
         assert_eq!(agents.len(), 2);
         assert_eq!(
             agents.iter().filter(|a| a.progress.is_some()).count(),
@@ -651,7 +868,12 @@ mod tests {
             set_mtime_ago(&entry.path(), AGENT_STALE_SECS + 60);
         }
 
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -672,7 +894,12 @@ mod tests {
         .unwrap();
 
         // Fresh: lingers with full progress and Idle state
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].progress, Some((2, 2)));
         assert_eq!(agents[0].state, SessionState::Idle);
@@ -681,7 +908,12 @@ mod tests {
         for entry in fs::read_dir(&run_dir).unwrap().flatten() {
             set_mtime_ago(&entry.path(), RUN_DONE_LINGER_SECS + 60);
         }
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -691,6 +923,7 @@ mod tests {
         TeammateStatus {
             spawned_at: Some(chrono::Utc::now()),
             last_idle_at: None,
+            terminated: false,
         }
     }
 
@@ -699,6 +932,7 @@ mod tests {
         TeammateStatus {
             spawned_at: Some(now - chrono::TimeDelta::seconds(600)),
             last_idle_at: Some(now),
+            terminated: false,
         }
     }
 
@@ -713,7 +947,7 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), spawned_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-fixer"));
     }
@@ -729,7 +963,7 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), idle_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].state, SessionState::Idle);
     }
@@ -745,11 +979,11 @@ mod tests {
         );
         set_mtime_ago(
             &dir.path().join("agent-amy-fixer-782b353b34c66890.jsonl"),
-            TEAMMATE_IDLE_HIDE_SECS + 60,
+            TEAMMATE_IDLE_HIDE_SECS + 121,
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), idle_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
         assert!(agents.is_empty());
     }
 
@@ -770,7 +1004,7 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), spawned_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
         assert!(agents.is_empty());
     }
 
@@ -795,7 +1029,7 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), spawned_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].task, "Second spawn");
     }
@@ -816,10 +1050,185 @@ mod tests {
         .unwrap();
 
         let teammates = HashMap::from([("my-fixer".to_string(), spawned_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-fixer"));
         assert_eq!(agents[0].task, "Curated task title");
+    }
+
+    // ── synchronous agents (meta toolUseId join) ─────────────────
+
+    #[test]
+    fn scan_subagents_sync_agent_active_until_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_file(dir.path(), "sync1", "Sync agent", 1_000);
+        fs::write(
+            dir.path().join("agent-sync1.meta.json"),
+            r#"{"agentType":"general-purpose","toolUseId":"toolu_123"}"#,
+        )
+        .unwrap();
+
+        // No tool_result yet → visible
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].task, "Sync agent");
+
+        // tool_result arrived → finished, hidden
+        let completed = HashSet::from(["toolu_123".to_string()]);
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &completed, &HashMap::new());
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn scan_subagents_sync_agent_stopped_by_user_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_file(dir.path(), "sync1", "Sync agent", 1_000);
+        fs::write(
+            dir.path().join("agent-sync1.meta.json"),
+            r#"{"agentType":"general-purpose","toolUseId":"toolu_123","stoppedByUser":true}"#,
+        )
+        .unwrap();
+
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(agents.is_empty());
+    }
+
+    #[test]
+    fn scan_subagents_terminated_teammate_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        write_agent_file(
+            dir.path(),
+            "amy-fixer-782b353b34c66890",
+            "Fix things",
+            3_000,
+        );
+
+        let status = TeammateStatus {
+            spawned_at: Some(chrono::Utc::now()),
+            last_idle_at: None,
+            terminated: true,
+        };
+        let teammates = HashMap::from([("my-fixer".to_string(), status)]);
+        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
+        assert!(agents.is_empty());
+    }
+
+    // ── workflow snapshots and respawn counting ──────────────────
+
+    #[test]
+    fn workflow_run_counts_by_key_across_respawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("workflows").join("wf_retry");
+        fs::create_dir_all(&run_dir).unwrap();
+        // The same cache key started twice (respawn) then finished once
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            concat!(
+                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a1\"}\n",
+                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a2\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"a2\",\"result\":\"ok\"}\n",
+            ),
+        )
+        .unwrap();
+        write_agent_file(&run_dir, "a2", "Retried agent", 1_000);
+
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].progress, Some((1, 1)));
+    }
+
+    #[test]
+    fn workflow_run_snapshot_is_authoritative() {
+        let root = tempfile::tempdir().unwrap();
+        let subagents_dir = root.path().join("subagents");
+        let run_dir = subagents_dir.join("workflows").join("wf_failed");
+        fs::create_dir_all(&run_dir).unwrap();
+        // Dangling started (a failed agent never writes a result line)
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a1\"}\n",
+        )
+        .unwrap();
+        write_agent_file(&run_dir, "a1", "Doomed agent", 1_000);
+        // Completion snapshot marks the run terminal
+        let snapshots = root.path().join("workflows");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::write(
+            snapshots.join("wf_failed.json"),
+            r#"{"status":"failed","workflowName":"my-flow","totalTokens":42}"#,
+        )
+        .unwrap();
+
+        let agents = scan_subagents(
+            &subagents_dir,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+        let run = &agents[0];
+        assert_eq!(run.name.as_deref(), Some("my-flow"));
+        assert_eq!(run.context_tokens, 42);
+        assert_eq!(run.state, SessionState::Idle);
+        assert_eq!(run.task, "failed");
+
+        // Once the snapshot ages past the linger window the run hides
+        set_mtime_ago(&snapshots.join("wf_failed.json"), RUN_DONE_LINGER_SECS + 31);
+        let agents = scan_subagents(
+            &subagents_dir,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert!(agents.is_empty());
+    }
+
+    // ── team_membership ──────────────────────────────────────────
+
+    #[test]
+    fn team_membership_member_absent_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let team_dir = dir.path().join("session-abc");
+        fs::create_dir_all(&team_dir).unwrap();
+        fs::write(
+            team_dir.join("config.json"),
+            r#"{"name":"session-abc","members":[
+                {"agentId":"my-fixer@session-abc","name":"my-fixer","joinedAt":1783569232384}
+            ]}"#,
+        )
+        .unwrap();
+
+        match team_membership(dir.path(), "session-abc", "my-fixer") {
+            TeamMembership::Member(Some(joined)) => {
+                assert_eq!(joined.timestamp_millis(), 1_783_569_232_384);
+            }
+            other => panic!("expected Member(Some(_)), got {other:?}"),
+        }
+        // A member missing from a readable config was killed
+        assert_eq!(
+            team_membership(dir.path(), "session-abc", "killed-one"),
+            TeamMembership::Absent
+        );
+        // A missing config is no signal at all
+        assert_eq!(
+            team_membership(dir.path(), "no-such-team", "my-fixer"),
+            TeamMembership::Unknown
+        );
     }
 
     // ── teammate_name_of ─────────────────────────────────────────
@@ -861,7 +1270,12 @@ mod tests {
         fs::create_dir_all(&run_dir).unwrap();
         write_agent_file(&run_dir, "wf1", "No journal here", 1_000);
 
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -996,7 +1410,7 @@ mod tests {
     fn parse_subagent_extracts_model_and_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_usage_agent(dir.path(), "claude-sonnet-4-20250514", 12_345);
-        let agent = parse_subagent(&path).unwrap();
+        let (agent, _) = parse_subagent(&path).unwrap();
         assert_eq!(agent.model, ModelShort::Sonnet);
         assert_eq!(agent.context_tokens, 12_345);
     }
@@ -1016,7 +1430,7 @@ mod tests {
         writeln!(f, "{usage2}").unwrap();
         f.sync_all().unwrap();
 
-        let agent = parse_subagent(&path).unwrap();
+        let (agent, _) = parse_subagent(&path).unwrap();
         // Zero-token usage should not overwrite the previous positive value
         assert_eq!(agent.context_tokens, 5000);
         assert_eq!(agent.model, ModelShort::Opus);
