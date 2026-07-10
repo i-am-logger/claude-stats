@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/i-am-logger/claude-stats/compare/v1.5.5...v1.6.0) (2026-07-10)
+
+
+### Features
+
+* show named teammates with runtime and honest agent liveness ([#20](https://github.com/i-am-logger/claude-stats/issues/20)) ([4d7bfde](https://github.com/i-am-logger/claude-stats/commit/4d7bfde22b7c76a1a88662eab70c422f19316f4d))
+
 ## [1.5.5](https://github.com/i-am-logger/claude-stats/compare/v1.5.4...v1.5.5) (2026-07-09)
 
 
