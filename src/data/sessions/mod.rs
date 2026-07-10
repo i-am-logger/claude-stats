@@ -52,8 +52,20 @@ impl std::fmt::Display for ModelShort {
 #[derive(Debug, Clone)]
 pub struct SubagentData {
     pub task: String,
+    /// Teammate name from the `.meta.json` sidecar; `None` for anonymous
+    /// Task-tool and workflow agents.
+    pub name: Option<String>,
     pub model: ModelShort,
     pub context_tokens: u64,
+    /// Seconds since the agent transcript's first entry.
+    pub runtime_secs: Option<u64>,
+    /// Seconds since the transcript was last written. Used to downgrade the
+    /// displayed state of agents that stopped writing without a completion
+    /// marker.
+    pub last_write_age_secs: u64,
+    /// For rows that aggregate a whole workflow run: `(done, total)` agent
+    /// counts. `None` for individual agents.
+    pub progress: Option<(u32, u32)>,
     /// Used for display only; active/completed filtering uses parent JSONL tracking.
     pub state: SessionState,
 }

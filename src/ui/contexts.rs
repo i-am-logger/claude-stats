@@ -16,11 +16,60 @@ fn contexts_height(sessions: &[SessionData]) -> u16 {
     }
     let mut h: u16 = 2; // header + blank
     for session in sessions {
-        h = h.saturating_add(4); // title + bar + info + state
+        h = h.saturating_add(3); // title + bar + info
+        if has_state_row(session) {
+            h = h.saturating_add(1);
+        }
         h = h.saturating_add(session.agents.len() as u16);
         h = h.saturating_add(1); // spacer
     }
     h
+}
+
+/// Whether the session gets a state row. An empty state row would render as
+/// a second blank line, making inter-session gaps uneven.
+fn has_state_row(session: &SessionData) -> bool {
+    !session.activity.is_empty() || !session.agents.is_empty()
+}
+
+/// Roster summary distinguishing plain agents from aggregated workflow
+/// runs: "2 agents", "1 workflow", "1 agent · 2 workflows".
+fn format_roster_count(agents: &[SubagentData]) -> String {
+    let workflows = agents.iter().filter(|a| a.progress.is_some()).count();
+    let plain = agents.len() - workflows;
+    let mut parts = Vec::new();
+    if plain > 0 {
+        parts.push(format!(
+            "{plain} agent{}",
+            if plain == 1 { "" } else { "s" }
+        ));
+    }
+    if workflows > 0 {
+        parts.push(format!(
+            "{workflows} workflow{}",
+            if workflows == 1 { "" } else { "s" }
+        ));
+    }
+    parts.join(" · ")
+}
+
+/// Compact two-unit runtime: "42s", "12m 42s", "1h 4m", "2d 1h".
+fn format_runtime(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn session_indicator(state: SessionState, tick: u64) -> (String, Color) {
@@ -61,7 +110,17 @@ fn state_color(state: SessionState) -> Color {
     }
 }
 
-fn agent_state_display(state: SessionState) -> (&'static str, Color) {
+/// An agent whose transcript has been quiet this long can't honestly claim
+/// active work — render "stale" instead of "working"/"thinking". It stays
+/// listed (it might be mid-long-model-turn) until the liveness rules drop it.
+const AGENT_STALE_DISPLAY_SECS: u64 = 300;
+
+fn agent_state_display(state: SessionState, last_write_age_secs: u64) -> (&'static str, Color) {
+    if last_write_age_secs > AGENT_STALE_DISPLAY_SECS
+        && matches!(state, SessionState::Working | SessionState::Thinking)
+    {
+        return ("stale", DIM);
+    }
     match state {
         SessionState::Thinking => ("thinking", Color::Cyan),
         SessionState::Working => ("working", Color::Green),
@@ -121,7 +180,9 @@ impl Section for ContextsSection<'_> {
             constraints.push(Constraint::Length(1)); // title
             constraints.push(Constraint::Length(1)); // bar
             constraints.push(Constraint::Length(1)); // info
-            constraints.push(Constraint::Length(1)); // state
+            if has_state_row(session) {
+                constraints.push(Constraint::Length(1)); // state
+            }
             for _ in &session.agents {
                 constraints.push(Constraint::Length(1));
             }
@@ -146,14 +207,19 @@ impl Section for ContextsSection<'_> {
         i += 2; // header + blank
 
         for session in self.sessions {
-            let Some(rows) = chunks.get(i..i + 4) else {
+            let Some(rows) = chunks.get(i..i + 3) else {
                 return;
             };
             render_title_row(session, self.tick, frame, rows[0]);
             render_context_bar(session, frame, rows[1]);
             render_info_row(session, frame, rows[2]);
-            render_state_row(session, frame, rows[3]);
-            i += 4;
+            i += 3;
+            if has_state_row(session) {
+                if let Some(&state_area) = chunks.get(i) {
+                    render_state_row(session, frame, state_area);
+                }
+                i += 1;
+            }
             render_agents(&session.agents, frame, &chunks, &mut i);
             i += 1; // spacer
         }
@@ -204,7 +270,7 @@ fn render_info_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
         ));
     }
     spans.push(Span::styled(
-        format!("  {}", &session.last_activity_label),
+        format!("  {}", session.last_activity_label),
         Style::default().fg(DIM),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), indented(area));
@@ -221,7 +287,7 @@ fn render_state_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
             spans.push(Span::styled(" · ", Style::default().fg(DIM)));
         }
         spans.push(Span::styled(
-            format!("{} agents", session.agents.len()),
+            format_roster_count(&session.agents),
             Style::default().fg(Color::Magenta),
         ));
     }
@@ -247,17 +313,48 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
             return;
         };
         let connector = tree_connector(idx + 1 == agents.len());
-        let (a_state, a_color) = agent_state_display(agent.state);
-        let tokens_k = format_agent_tokens_k(agent.context_tokens);
-        let mut spans = vec![
-            Span::styled(connector, Style::default().fg(DIM)),
-            Span::styled(agent.model.to_string(), Style::default().fg(Color::Blue)),
-            Span::styled(format!(" {tokens_k}"), Style::default().fg(DIM)),
-            Span::styled(format!(" {a_state}"), Style::default().fg(a_color)),
-        ];
-        if !agent.task.is_empty() {
+        let mut spans = vec![Span::styled(connector, Style::default().fg(DIM))];
+        if let Some(name) = &agent.name {
             spans.push(Span::styled(
-                format!(" — {}", agent.task),
+                format!("{name} "),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some((done, total)) = agent.progress {
+            // Aggregated workflow run — mirrors Claude Code's roster entry.
+            let (_, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
+            spans.push(Span::styled(
+                format!("{done}/{total} agents done"),
+                Style::default().fg(a_color),
+            ));
+        } else {
+            let (a_state, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
+            spans.push(Span::styled(
+                agent.model.to_string(),
+                Style::default().fg(Color::Blue),
+            ));
+            spans.push(Span::styled(
+                format!(" {a_state}"),
+                Style::default().fg(a_color),
+            ));
+            if !agent.task.is_empty() {
+                spans.push(Span::styled(
+                    format!(" — {}", agent.task),
+                    Style::default().fg(DIM),
+                ));
+            }
+        }
+        if let Some(runtime) = agent.runtime_secs {
+            spans.push(Span::styled(
+                format!(" · {}", format_runtime(runtime)),
+                Style::default().fg(DIM),
+            ));
+        }
+        if agent.context_tokens > 0 {
+            spans.push(Span::styled(
+                format!(" · \u{2193}{}", format_agent_tokens_k(agent.context_tokens)),
                 Style::default().fg(DIM),
             ));
         }
@@ -281,9 +378,13 @@ mod tests {
             agents: (0..agents)
                 .map(|_| SubagentData {
                     task: "test".into(),
+                    name: None,
                     model: ModelShort::Sonnet,
                     context_tokens: 5000,
+                    runtime_secs: Some(90),
+                    last_write_age_secs: 0,
                     state: SessionState::Working,
+                    progress: None,
                 })
                 .collect(),
             compactions: 0,
@@ -313,6 +414,14 @@ mod tests {
             contexts_height(&[make_session(2, SessionState::Working)]),
             9
         );
+    }
+
+    #[test]
+    fn contexts_height_idle_session_without_activity_drops_state_row() {
+        let mut session = make_session(0, SessionState::Idle);
+        session.activity = String::new();
+        // 2 (header+blank) + 3 (title+bar+info) + 0 agents + 1 spacer = 6
+        assert_eq!(contexts_height(&[session]), 6);
     }
 
     #[test]
@@ -386,6 +495,72 @@ mod tests {
         assert_eq!(format_agent_tokens_k(5_000), "5.0k");
     }
 
+    #[test]
+    fn format_runtime_seconds() {
+        assert_eq!(format_runtime(42), "42s");
+    }
+
+    #[test]
+    fn format_runtime_minutes() {
+        assert_eq!(format_runtime(762), "12m 42s");
+    }
+
+    #[test]
+    fn format_runtime_hours() {
+        assert_eq!(format_runtime(3840), "1h 4m");
+    }
+
+    #[test]
+    fn format_runtime_days() {
+        assert_eq!(format_runtime(2 * 86_400 + 3600 + 59), "2d 1h");
+    }
+
+    fn agent_row(progress: Option<(u32, u32)>) -> SubagentData {
+        SubagentData {
+            task: "test".into(),
+            name: None,
+            model: ModelShort::Sonnet,
+            context_tokens: 5000,
+            runtime_secs: Some(90),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress,
+        }
+    }
+
+    #[test]
+    fn roster_count_agents_only() {
+        assert_eq!(format_roster_count(&[agent_row(None)]), "1 agent");
+        assert_eq!(
+            format_roster_count(&[agent_row(None), agent_row(None)]),
+            "2 agents"
+        );
+    }
+
+    #[test]
+    fn roster_count_workflows_only() {
+        assert_eq!(
+            format_roster_count(&[agent_row(Some((0, 2))), agent_row(Some((1, 4)))]),
+            "2 workflows"
+        );
+        assert_eq!(
+            format_roster_count(&[agent_row(Some((0, 2)))]),
+            "1 workflow"
+        );
+    }
+
+    #[test]
+    fn roster_count_mixed() {
+        assert_eq!(
+            format_roster_count(&[
+                agent_row(None),
+                agent_row(Some((0, 2))),
+                agent_row(Some((1, 4)))
+            ]),
+            "1 agent · 2 workflows"
+        );
+    }
+
     // ── state_color ──────────────────────────────────────────
 
     #[test]
@@ -407,23 +582,37 @@ mod tests {
 
     #[test]
     fn agent_state_thinking() {
-        let (label, color) = agent_state_display(SessionState::Thinking);
+        let (label, color) = agent_state_display(SessionState::Thinking, 0);
         assert_eq!(label, "thinking");
         assert_eq!(color, Color::Cyan);
     }
 
     #[test]
     fn agent_state_working() {
-        let (label, color) = agent_state_display(SessionState::Working);
+        let (label, color) = agent_state_display(SessionState::Working, 0);
         assert_eq!(label, "working");
         assert_eq!(color, Color::Green);
     }
 
     #[test]
     fn agent_state_idle() {
-        let (label, color) = agent_state_display(SessionState::Idle);
+        let (label, color) = agent_state_display(SessionState::Idle, 0);
         assert_eq!(label, "idle");
         assert_eq!(color, DIM);
+    }
+
+    #[test]
+    fn agent_state_working_but_quiet_shows_stale() {
+        let (label, color) =
+            agent_state_display(SessionState::Working, AGENT_STALE_DISPLAY_SECS + 1);
+        assert_eq!(label, "stale");
+        assert_eq!(color, DIM);
+    }
+
+    #[test]
+    fn agent_state_idle_never_stale() {
+        let (label, _) = agent_state_display(SessionState::Idle, AGENT_STALE_DISPLAY_SECS + 1);
+        assert_eq!(label, "idle");
     }
 
     // ── tree_connector ───────────────────────────────────────
@@ -436,5 +625,158 @@ mod tests {
     #[test]
     fn tree_connector_not_last() {
         assert_eq!(tree_connector(false), "\u{251c} ");
+    }
+
+    // ── render (TestBackend) ─────────────────────────────────────
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render the section into a test terminal and return the screen text.
+    fn render_to_text(sessions: &[SessionData], width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let section = ContextsSection { sessions, tick: 0 };
+                let area = frame.area();
+                section.render(frame, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer.cell((x, y)).map_or(" ", |c| c.symbol()));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn render_empty_shows_no_active_contexts() {
+        let text = render_to_text(&[], 60, 5);
+        assert!(text.contains("Active contexts (0)"));
+        assert!(text.contains("No active contexts"));
+    }
+
+    #[test]
+    fn render_session_title_bar_and_info() {
+        let session = make_session(0, SessionState::Working);
+        let text = render_to_text(&[session], 80, 12);
+        assert!(text.contains("Active contexts (1)"));
+        assert!(text.contains("test (30% — 50.00k/200k)"));
+        assert!(text.contains("⎇ main"));
+        assert!(text.contains("5s ago"));
+        assert!(text.contains("Bash(ls)"));
+    }
+
+    #[test]
+    fn render_idle_session_indicator() {
+        let session = make_session(0, SessionState::Idle);
+        let text = render_to_text(&[session], 80, 12);
+        assert!(text.contains("○ test"));
+    }
+
+    #[test]
+    fn render_compactions_shown_when_present() {
+        let mut session = make_session(0, SessionState::Idle);
+        session.compactions = 3;
+        let text = render_to_text(&[session], 80, 12);
+        assert!(text.contains("3x compacted"));
+    }
+
+    #[test]
+    fn render_agent_row_with_name_runtime_and_tokens() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: "Fix things".into(),
+            name: Some("my-fixer".into()),
+            model: ModelShort::Opus,
+            context_tokens: 5_000,
+            runtime_secs: Some(762),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: None,
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("1 agent"));
+        assert!(text.contains("└ my-fixer opus working — Fix things · 12m 42s · ↓5.0k"));
+    }
+
+    #[test]
+    fn render_workflow_row_with_progress() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: String::new(),
+            name: Some("my-flow".into()),
+            model: ModelShort::Unknown,
+            context_tokens: 305_800,
+            runtime_secs: Some(2518),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: Some((1, 2)),
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("1 workflow"));
+        assert!(text.contains("└ my-flow 1/2 agents done · 41m 58s · ↓305.8k"));
+    }
+
+    #[test]
+    fn render_stale_agent_state() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: "Quiet work".into(),
+            name: None,
+            model: ModelShort::Sonnet,
+            context_tokens: 1_000,
+            runtime_secs: None,
+            last_write_age_secs: AGENT_STALE_DISPLAY_SECS + 1,
+            state: SessionState::Working,
+            progress: None,
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("sonnet stale — Quiet work"));
+        // No runtime span when the start time is unknown
+        assert!(!text.contains(" · ↓1.0k · "));
+    }
+
+    #[test]
+    fn render_multiple_agents_use_tree_connectors() {
+        let session = make_session(2, SessionState::Working);
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("├ sonnet working — test"));
+        assert!(text.contains("└ sonnet working — test"));
+        assert!(text.contains("2 agents"));
+    }
+
+    #[test]
+    fn render_idle_session_without_activity_has_no_state_row() {
+        let mut idle = make_session(0, SessionState::Idle);
+        idle.activity = String::new();
+        let working = make_session(0, SessionState::Working);
+        let text = render_to_text(&[idle, working], 80, 16);
+        // Both sessions render; the idle one contributes no activity line
+        assert_eq!(text.matches("⎇ main").count(), 2);
+        assert_eq!(text.matches("Bash(ls)").count(), 1);
+    }
+
+    #[test]
+    fn render_zero_token_agent_omits_token_span() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: "Just started".into(),
+            name: None,
+            model: ModelShort::Unknown,
+            context_tokens: 0,
+            runtime_secs: Some(5),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: None,
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("? working — Just started · 5s"));
+        assert!(!text.contains("↓0.0k"));
     }
 }

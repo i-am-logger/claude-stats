@@ -234,6 +234,9 @@ impl SessionCache {
                     if !result.model.is_empty() {
                         cached.model = result.model;
                     }
+                    if !result.git_branch.is_empty() {
+                        cached.git_branch = result.git_branch;
+                    }
                     Some(Self::result_from_cache(cached))
                 }
                 std::cmp::Ordering::Equal => Some(Self::result_from_cache(cached)),
@@ -262,11 +265,19 @@ impl SessionCache {
         // even after the parent conversation turn finishes (Idle state).
         let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
-        let mut active_ids = self.update_agent_tracking(path);
-        // Workflow-spawned agents track via per-run journals, not the parent
-        // session JSONL.
-        active_ids.extend(subagents::workflow_active_ids(&subagents_dir));
-        let agents = subagents::scan_subagents(&subagents_dir, &active_ids);
+        let active_ids = self.update_agent_tracking(path);
+        let (completed_tool_ids, teammates) = self
+            .entries
+            .get(path)
+            .map(|cached| {
+                (
+                    cached.tracker.completed_tool_ids().clone(),
+                    cached.tracker.teammates().clone(),
+                )
+            })
+            .unwrap_or_default();
+        let agents =
+            subagents::scan_subagents(&subagents_dir, &active_ids, &completed_tool_ids, &teammates);
 
         let context_window = tail::context_window_for_model(&sfr.model);
         let context_percent = ((sfr.last_tokens.min(context_window) * 100) / context_window) as u16;
@@ -416,6 +427,38 @@ mod tests {
         let result = tail::scan_from_offset(f.as_file(), 0);
         assert_eq!(result.compactions, 1);
         assert_eq!(result.last_tokens, 2000);
+    }
+
+    #[test]
+    fn incremental_scan_updates_git_branch() {
+        // A branch switch mid-session appears on later entries; the cache
+        // must pick it up from the incremental read.
+        let user_line =
+            r#"{"type":"user","cwd":"/tmp/p","gitBranch":"main","message":{"content":"hi"}}"#;
+        let f = jsonl_file(&[user_line]);
+        let file_len = f.as_file().metadata().unwrap().len();
+
+        let mut cache = SessionCache::new();
+        let first = cache
+            .read_session_file(f.path(), f.as_file(), file_len)
+            .unwrap();
+        assert_eq!(first.git_branch, "main");
+
+        // Append an entry on a different branch and rescan incrementally
+        let mut file = f.as_file();
+        file.seek(SeekFrom::End(0)).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","cwd":"/tmp/p","gitBranch":"feat/new","message":{{"content":"go"}}}}"#
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        let new_len = file.metadata().unwrap().len();
+
+        let second = cache
+            .read_session_file(f.path(), f.as_file(), new_len)
+            .unwrap();
+        assert_eq!(second.git_branch, "feat/new");
     }
 
     // ── SessionCache integration ──────────────────────────────────
