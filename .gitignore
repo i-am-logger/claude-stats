@@ -12,4 +12,4 @@ devenv.local.yaml
 target/
 
 # Claude
-.claude/*
+.claude
