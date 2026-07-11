@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/i-am-logger/claude-stats/compare/v1.6.0...v1.6.1) (2026-07-11)
+
+
+### Bug Fixes
+
+* devenv & cargo update ([312797e](https://github.com/i-am-logger/claude-stats/commit/312797e9661aba4e14d3f5ab8220a564cb1008a9))
+
 ## [1.6.0](https://github.com/i-am-logger/claude-stats/compare/v1.5.5...v1.6.0) (2026-07-10)
 
 
