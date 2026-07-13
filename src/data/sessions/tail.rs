@@ -124,6 +124,9 @@ pub(crate) struct AgentTracker {
     completed_background_ids: HashSet<String>,
     /// Named teammates keyed by name.
     teammates: HashMap<String, TeammateStatus>,
+    /// Workflow run human names keyed by `runId`, captured from the launch
+    /// event — available before the run's script/snapshot are.
+    workflow_names: HashMap<String, String>,
 }
 
 impl AgentTracker {
@@ -186,6 +189,8 @@ impl AgentTracker {
                             status.spawned_at = status.spawned_at.max(entry_timestamp(val));
                         }
                     }
+
+                    self.note_workflow_launch(tur);
                 }
 
                 // A <teammate-message> idle notification marks a teammate idle.
@@ -261,6 +266,11 @@ impl AgentTracker {
             entry.last_idle_at = entry.last_idle_at.max(status.last_idle_at);
             entry.terminated = entry.terminated || status.terminated;
         }
+        for (run_id, name) in &other.workflow_names {
+            self.workflow_names
+                .entry(run_id.clone())
+                .or_insert_with(|| name.clone());
+        }
     }
 
     /// Named teammates observed so far, keyed by name.
@@ -268,10 +278,48 @@ impl AgentTracker {
         &self.teammates
     }
 
+    /// Workflow run names observed via launch events, keyed by `runId`.
+    pub fn workflow_names(&self) -> &HashMap<String, String> {
+        &self.workflow_names
+    }
+
     /// Tool-use ids that already received a `tool_result` — used to detect
     /// finished synchronous subagents via their meta.json `toolUseId`.
     pub fn completed_tool_ids(&self) -> &HashSet<String> {
         &self.completed_tool_ids
+    }
+
+    /// Record a workflow run's human name from its launch event
+    /// (`toolUseResult.taskType == "local_workflow"`) — available immediately,
+    /// before the run's persisted script or completion snapshot exist.
+    fn note_workflow_launch(&mut self, tool_use_result: &serde_json::Value) {
+        if tool_use_result
+            .get("taskType")
+            .and_then(serde_json::Value::as_str)
+            != Some("local_workflow")
+        {
+            return;
+        }
+        let Some(run_id) = tool_use_result
+            .get("runId")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let Some(name) = tool_use_result
+            .get("workflowName")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                tool_use_result
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+            })
+        else {
+            return;
+        };
+        self.workflow_names
+            .entry(run_id.to_string())
+            .or_insert_with(|| name.to_string());
     }
 
     /// Record teammate lifecycle frames carried in a teammate message. The
@@ -1164,6 +1212,102 @@ mod tests {
         ));
         tracker.process(&val);
         assert!(tracker.teammates()["fix-docrefs"].terminated);
+    }
+
+    // ── workflow launch events ──────────────────────────────────────
+
+    #[test]
+    fn tracker_workflow_launch_captures_name() {
+        let val = serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "status": "async_launched",
+                "taskType": "local_workflow",
+                "taskId": "w1a2b3c4",
+                "runId": "wf_8001925fe44a",
+                "workflowName": "review-changes",
+                "scriptPath": "/tmp/script.js",
+                "transcriptDir": "/tmp",
+                "summary": "Review changed files"
+            },
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_wf", "content": "launched"}
+            ]}
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert_eq!(
+            tracker.workflow_names().get("wf_8001925fe44a"),
+            Some(&"review-changes".to_string())
+        );
+    }
+
+    #[test]
+    fn tracker_workflow_launch_falls_back_to_summary() {
+        let val = serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "status": "async_launched",
+                "taskType": "local_workflow",
+                "runId": "wf_noname",
+                "summary": "Ad-hoc workflow run"
+            },
+            "message": {"content": []}
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert_eq!(
+            tracker.workflow_names().get("wf_noname"),
+            Some(&"Ad-hoc workflow run".to_string())
+        );
+    }
+
+    #[test]
+    fn tracker_workflow_launch_ignores_other_task_types() {
+        let val = serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "status": "async_launched",
+                "taskType": "local_agent",
+                "runId": "wf_not_a_workflow",
+                "workflowName": "should-not-appear"
+            },
+            "message": {"content": []}
+        });
+        let mut tracker = AgentTracker::new();
+        tracker.process(&val);
+        assert!(tracker.workflow_names().is_empty());
+    }
+
+    #[test]
+    fn tracker_workflow_launch_merge_keeps_first_seen_name() {
+        let mut a = AgentTracker::new();
+        a.process(&serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "status": "async_launched",
+                "taskType": "local_workflow",
+                "runId": "wf_shared",
+                "workflowName": "first-seen"
+            },
+            "message": {"content": []}
+        }));
+        let mut b = AgentTracker::new();
+        b.process(&serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "status": "async_launched",
+                "taskType": "local_workflow",
+                "runId": "wf_shared",
+                "workflowName": "second-seen"
+            },
+            "message": {"content": []}
+        }));
+        a.merge(&b);
+        assert_eq!(
+            a.workflow_names().get("wf_shared"),
+            Some(&"first-seen".to_string())
+        );
     }
 
     #[test]

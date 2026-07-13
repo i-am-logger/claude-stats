@@ -39,7 +39,9 @@ pub(crate) const RUN_DONE_LINGER_SECS: u64 = 30;
 /// tracking shows as still in-progress; `completed_tool_ids` are `tool_use`
 /// ids with a `tool_result` (finishing synchronous agents, joined via their
 /// meta.json `toolUseId`). `teammates` maps named-teammate lifecycle
-/// statuses observed in the parent JSONL. Workflow runs under
+/// statuses observed in the parent JSONL. `workflow_names` maps workflow
+/// `runId` to its human name, captured from the parent JSONL's launch event
+/// (available before the run's script/snapshot are). Workflow runs under
 /// `subagents/workflows/<run-id>/` aggregate into a single row each.
 #[allow(
     clippy::implicit_hasher,
@@ -50,10 +52,11 @@ pub fn scan_subagents(
     active_ids: &HashSet<String>,
     completed_tool_ids: &HashSet<String>,
     teammates: &HashMap<String, TeammateStatus>,
+    workflow_names: &HashMap<String, String>,
 ) -> Vec<SubagentData> {
     let mut agents = collect_agents(subagents_dir, active_ids, completed_tool_ids, teammates);
 
-    agents.extend(scan_workflow_runs(subagents_dir));
+    agents.extend(scan_workflow_runs(subagents_dir, workflow_names));
 
     dedup_teammates(&mut agents);
 
@@ -224,7 +227,10 @@ fn parse_teammate(
 /// JSONL; each run journals into `<run-id>/journal.jsonl` with one
 /// `{"type":"started","agentId":...}` line per launched agent and a matching
 /// `{"type":"result",...}` line when it completes.
-fn scan_workflow_runs(subagents_dir: &Path) -> Vec<SubagentData> {
+fn scan_workflow_runs(
+    subagents_dir: &Path,
+    workflow_names: &HashMap<String, String>,
+) -> Vec<SubagentData> {
     let Ok(runs) = fs::read_dir(subagents_dir.join("workflows")) else {
         return Vec::new();
     };
@@ -245,7 +251,7 @@ fn scan_workflow_runs(subagents_dir: &Path) -> Vec<SubagentData> {
             if !dir_recently_written(&run_dir, AGENT_STALE_SECS) {
                 return None;
             }
-            parse_workflow_run(&run_dir, scripts_dir.as_deref())
+            parse_workflow_run(&run_dir, scripts_dir.as_deref(), workflow_names)
         })
         .collect()
 }
@@ -262,7 +268,11 @@ struct RunSnapshot {
     total_tokens: Option<u64>,
 }
 
-fn parse_workflow_run(run_dir: &Path, scripts_dir: Option<&Path>) -> Option<SubagentData> {
+fn parse_workflow_run(
+    run_dir: &Path,
+    scripts_dir: Option<&Path>,
+    workflow_names: &HashMap<String, String>,
+) -> Option<SubagentData> {
     let journal = fs::File::open(run_dir.join("journal.jsonl")).ok()?;
     // Count by cache KEY, not agentId: stall/throttle respawns append extra
     // started lines with new agentIds for the same key.
@@ -339,7 +349,11 @@ fn parse_workflow_run(run_dir: &Path, scripts_dir: Option<&Path>) -> Option<Suba
         } else {
             String::new()
         },
-        name: Some(snapshot_name.unwrap_or_else(|| workflow_run_name(run_dir, scripts_dir))),
+        name: Some(
+            snapshot_name
+                .or_else(|| workflow_names.get(run_id).cloned())
+                .unwrap_or_else(|| workflow_run_name(run_dir, scripts_dir)),
+        ),
         model: ModelShort::Unknown,
         context_tokens: snapshot_tokens.unwrap_or(total_tokens),
         runtime_secs,
@@ -409,9 +423,11 @@ fn file_age_secs(path: &Path) -> Option<u64> {
     Some(modified.elapsed().map_or(0, |age| age.as_secs()))
 }
 
-/// Resolve a workflow run's human name from its persisted script:
-/// `<session>/workflows/scripts/<name>-<run-id>.js`. Falls back to the
-/// run-dir name (`wf_...`).
+/// Last-resort name fallback: reconstruct a workflow run's human name from
+/// its persisted script filename (`<session>/workflows/scripts/<name>-<run-id>.js`).
+/// Only reached when neither the completion snapshot nor the parent JSONL's
+/// launch event (`workflow_names`) had a name yet. Falls back further to the
+/// raw run-dir name (`wf_...`).
 fn workflow_run_name(run_dir: &Path, scripts_dir: Option<&Path>) -> String {
     let run_id = run_dir
         .file_name()
@@ -745,7 +761,13 @@ mod tests {
         write_agent_file(dir.path(), "ccc", "Task C", 1000);
 
         let active: HashSet<String> = ["aaa", "ccc"].iter().map(|s| (*s).to_string()).collect();
-        let agents = scan_subagents(dir.path(), &active, &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &active,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 2);
         let tasks: Vec<&str> = agents.iter().map(|a| a.task.as_str()).collect();
         assert!(tasks.contains(&"Task A"));
@@ -759,7 +781,13 @@ mod tests {
         write_agent_file(dir.path(), "aaa", "Task A", 1000);
 
         let active: HashSet<String> = HashSet::new();
-        let agents = scan_subagents(dir.path(), &active, &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &active,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -770,6 +798,7 @@ mod tests {
             Path::new("/nonexistent/dir/subagents"),
             &active,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(agents.is_empty());
@@ -783,7 +812,13 @@ mod tests {
         fs::write(&path, r#"{"type":"user","message":{"content":"hi"}}"#).unwrap();
 
         let active = HashSet::from(["xyz".to_string()]);
-        let agents = scan_subagents(dir.path(), &active, &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &active,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -822,6 +857,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         let run = &agents[0];
@@ -847,9 +883,56 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-flow"));
+    }
+
+    #[test]
+    fn scan_subagents_workflow_run_uses_launch_event_name_over_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_workflow_run(dir.path(), "wf_abc123");
+        // No completion snapshot, no persisted script — only the launch
+        // event's name is available. Should NOT fall back to the raw run id.
+        let workflow_names: HashMap<String, String> =
+            [("wf_abc123".to_string(), "review-changes".to_string())].into();
+
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &workflow_names,
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name.as_deref(), Some("review-changes"));
+    }
+
+    #[test]
+    fn scan_subagents_workflow_run_launch_event_wins_over_script_slug() {
+        // The launch event's `workflowName` is a direct structured field
+        // parsed straight from the parent JSONL — more authoritative than
+        // reverse-engineering a name from the persisted script's filename
+        // (which can race or fail to match, the exact gap this fixes).
+        let root = tempfile::tempdir().unwrap();
+        let subagents_dir = root.path().join("subagents");
+        write_workflow_run(&subagents_dir, "wf_abc123");
+        let scripts = root.path().join("workflows").join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(scripts.join("my-flow-wf_abc123.js"), "export const meta").unwrap();
+        let workflow_names: HashMap<String, String> =
+            [("wf_abc123".to_string(), "review-changes".to_string())].into();
+
+        let agents = scan_subagents(
+            &subagents_dir,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &workflow_names,
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name.as_deref(), Some("review-changes"));
     }
 
     #[test]
@@ -859,7 +942,13 @@ mod tests {
         write_workflow_run(dir.path(), "wf_abc123");
 
         let active = HashSet::from(["direct1".to_string()]);
-        let agents = scan_subagents(dir.path(), &active, &HashSet::new(), &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &active,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 2);
         assert_eq!(
             agents.iter().filter(|a| a.progress.is_some()).count(),
@@ -880,6 +969,7 @@ mod tests {
             dir.path(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(agents.is_empty());
@@ -907,6 +997,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].progress, Some((2, 2)));
@@ -920,6 +1011,7 @@ mod tests {
             dir.path(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(agents.is_empty());
@@ -955,7 +1047,13 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), spawned_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-fixer"));
     }
@@ -971,7 +1069,13 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), idle_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].state, SessionState::Idle);
     }
@@ -991,7 +1095,13 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), idle_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -1012,7 +1122,13 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), spawned_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -1037,7 +1153,13 @@ mod tests {
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), spawned_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].task, "Second spawn");
     }
@@ -1058,7 +1180,13 @@ mod tests {
         .unwrap();
 
         let teammates = HashMap::from([("my-fixer".to_string(), spawned_status())]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+        );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-fixer"));
         assert_eq!(agents[0].task, "Curated task title");
@@ -1082,13 +1210,20 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].task, "Sync agent");
 
         // tool_result arrived → finished, hidden
         let completed = HashSet::from(["toolu_123".to_string()]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &completed, &HashMap::new());
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &completed,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -1106,6 +1241,7 @@ mod tests {
             dir.path(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(agents.is_empty());
@@ -1127,7 +1263,13 @@ mod tests {
             terminated: true,
         };
         let teammates = HashMap::from([("my-fixer".to_string(), status)]);
-        let agents = scan_subagents(dir.path(), &HashSet::new(), &HashSet::new(), &teammates);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+        );
         assert!(agents.is_empty());
     }
 
@@ -1154,6 +1296,7 @@ mod tests {
             dir.path(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
@@ -1182,11 +1325,15 @@ mod tests {
         )
         .unwrap();
 
+        // A stale launch-event name should lose to the completion snapshot.
+        let workflow_names: HashMap<String, String> =
+            [("wf_failed".to_string(), "stale-launch-name".to_string())].into();
         let agents = scan_subagents(
             &subagents_dir,
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &workflow_names,
         );
         assert_eq!(agents.len(), 1);
         let run = &agents[0];
@@ -1201,6 +1348,7 @@ mod tests {
             &subagents_dir,
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(agents.is_empty());
@@ -1362,6 +1510,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(agents.is_empty());
     }
@@ -1369,7 +1518,7 @@ mod tests {
     #[test]
     fn workflow_run_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(scan_workflow_runs(dir.path()).is_empty());
+        assert!(scan_workflow_runs(dir.path(), &HashMap::new()).is_empty());
     }
 
     // ── read_subagent_task prefix stripping ─────────────────────

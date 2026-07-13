@@ -266,18 +266,24 @@ impl SessionCache {
         let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
         let active_ids = self.update_agent_tracking(path);
-        let (completed_tool_ids, teammates) = self
+        let (completed_tool_ids, teammates, workflow_names) = self
             .entries
             .get(path)
             .map(|cached| {
                 (
                     cached.tracker.completed_tool_ids().clone(),
                     cached.tracker.teammates().clone(),
+                    cached.tracker.workflow_names().clone(),
                 )
             })
             .unwrap_or_default();
-        let agents =
-            subagents::scan_subagents(&subagents_dir, &active_ids, &completed_tool_ids, &teammates);
+        let agents = subagents::scan_subagents(
+            &subagents_dir,
+            &active_ids,
+            &completed_tool_ids,
+            &teammates,
+            &workflow_names,
+        );
 
         let context_window = tail::context_window_for_model(&sfr.model);
         let context_percent = ((sfr.last_tokens.min(context_window) * 100) / context_window) as u16;
@@ -317,7 +323,7 @@ mod tests {
     use super::*;
     use crate::data::sessions::testutil::{
         assistant_usage_line, async_agent_launch_line, jsonl_file, progress_line,
-        queue_operation_complete_line, tool_result_line, write_agent_file,
+        queue_operation_complete_line, tool_result_line, workflow_launch_line, write_agent_file,
     };
     use crate::data::sessions::SessionState;
     use std::io::{Seek, SeekFrom, Write};
@@ -949,6 +955,49 @@ mod tests {
         // Only the active background agent should appear
         assert_eq!(session.agents.len(), 1);
         assert_eq!(session.agents[0].task, "Background search");
+    }
+
+    #[test]
+    fn parse_session_workflow_run_named_from_launch_event() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let session_id = "test-session-wf";
+        let parent_path = dir.path().join(format!("{session_id}.jsonl"));
+        let run_id = "wf_launchname";
+
+        let user_line = r#"{"type":"user","cwd":"/home/user/proj","gitBranch":"main","message":{"content":"go"}}"#;
+        let usage = assistant_usage_line(10_000);
+        let wf_launch = workflow_launch_line(run_id, "review-changes");
+        // End with working state (tool_use + progress for state detection)
+        let tool_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],"stop_reason":null}}"#;
+        let progress = r#"{"type":"progress","data":{"type":"bash_progress","output":"file.rs"}}"#;
+
+        {
+            let mut f = fs::File::create(&parent_path).unwrap();
+            for line in [user_line, &*usage, &*wf_launch, tool_use, progress] {
+                writeln!(f, "{line}").unwrap();
+            }
+            f.sync_all().unwrap();
+        }
+
+        // Workflow run dir: journal + one in-progress agent, no completion
+        // snapshot and no persisted script — the launch event is the only
+        // name source available.
+        let subagents_dir = dir.path().join(session_id).join("subagents");
+        let run_dir = subagents_dir.join("workflows").join(run_id);
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            r#"{"type":"started","key":"v2:k1","agentId":"wf1"}"#,
+        )
+        .unwrap();
+        write_agent_file(&run_dir, "wf1", "Review changed files", 2_000);
+
+        let mut cache = SessionCache::new();
+        let session = cache.parse_session(&parent_path, 1).unwrap();
+
+        assert_eq!(session.agents.len(), 1);
+        assert_eq!(session.agents[0].name.as_deref(), Some("review-changes"));
     }
 
     #[test]

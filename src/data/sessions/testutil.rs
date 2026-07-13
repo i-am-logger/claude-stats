@@ -55,6 +55,14 @@ pub(crate) fn async_agent_launch_line(
     )
 }
 
+/// User message with `toolUseResult.taskType: "local_workflow"` — launches a
+/// workflow run and carries its human name.
+pub(crate) fn workflow_launch_line(run_id: &str, workflow_name: &str) -> String {
+    format!(
+        r#"{{"type":"user","toolUseResult":{{"status":"async_launched","taskType":"local_workflow","taskId":"w1","runId":"{run_id}","workflowName":"{workflow_name}","scriptPath":"/tmp/script.js","transcriptDir":"/tmp","summary":"..."}},"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_wf","content":"launched"}}]}}}}"#
+    )
+}
+
 /// `queue-operation` enqueue with completed status — marks a background agent done.
 pub(crate) fn queue_operation_complete_line(agent_id: &str) -> String {
     format!(
