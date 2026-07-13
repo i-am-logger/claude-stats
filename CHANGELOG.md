@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.2](https://github.com/i-am-logger/claude-stats/compare/v1.6.1...v1.6.2) (2026-07-13)
+
+
+### Bug Fixes
+
+* name in-progress workflow runs from their launch event ([f8d3849](https://github.com/i-am-logger/claude-stats/commit/f8d3849d10b7d02214d379e30f56b849158e6b32))
+
 ## [1.6.1](https://github.com/i-am-logger/claude-stats/compare/v1.6.0...v1.6.1) (2026-07-11)
 
 
