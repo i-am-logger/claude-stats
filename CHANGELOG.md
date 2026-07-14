@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.7.0](https://github.com/i-am-logger/claude-stats/compare/v1.6.2...v1.7.0) (2026-07-14)
+
+
+### Features
+
+* show the shared TaskList's activeForm as session activity ([e5323b9](https://github.com/i-am-logger/claude-stats/commit/e5323b9034578e3346905ae2a77df2f7fe16f08c))
+* show workflow phase progress; fix stale teammate idle state ([9cee3ea](https://github.com/i-am-logger/claude-stats/commit/9cee3eafb9926a1f9c4b1f81c37a4fe1794445f4))
+
+
+### Bug Fixes
+
+* collapse idle teammates into a summary row past a threshold ([60d6d7f](https://github.com/i-am-logger/claude-stats/commit/60d6d7f87da6b8cb6dd5a562471f361622d2d0b4))
+* downgrade stale main-session rows; show turn_duration as done ([e375505](https://github.com/i-am-logger/claude-stats/commit/e375505f5a2efebcccc52eafb484c951bbc0420e))
+* evict idle teammates after AGENT_STALE_SECS, not never ([fd63b06](https://github.com/i-am-logger/claude-stats/commit/fd63b06639902f17a209c1c5f31db1a3861f3a7b))
+* give every agent row an active/idle glyph, like the session row ([1922b79](https://github.com/i-am-logger/claude-stats/commit/1922b79fa0bdea2ca01d4b65412b2c99cec678e3))
+* redesign roster rendering to match Claude Code's real behavior ([991a198](https://github.com/i-am-logger/claude-stats/commit/991a1982c584c2dcf6715da4b606ffbf446d53a1))
+* resolve TaskUpdate's activeForm via direct by-id lookup ([38dc5ff](https://github.com/i-am-logger/claude-stats/commit/38dc5ff35b068265b06ac6205ec487f5f7a01690))
+* show real turn elapsed-time; stop resetting it on tool_results ([e4d1e9f](https://github.com/i-am-logger/claude-stats/commit/e4d1e9f583933f39d147606cafcc03c90ee047d7))
+* stop reconstructing raw tool calls as activity text ([1be743d](https://github.com/i-am-logger/claude-stats/commit/1be743dec247a1065993d4b8de039fb24758da26))
+
 ## [1.6.2](https://github.com/i-am-logger/claude-stats/compare/v1.6.1...v1.6.2) (2026-07-13)
 
 
