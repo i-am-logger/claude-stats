@@ -10,6 +10,19 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs;
 
+/// A session's activity text, as far as `activity.rs` alone can resolve it.
+///
+/// Almost everything resolves directly to `Text`; `TaskUpdate` is the one
+/// exception — its `tool_use` input is only `{taskId, status}`, no human
+/// text, so the caller (which has `session_id`/`tasks_root`, unavailable in
+/// this filesystem-agnostic module) must resolve it with a further shared-
+/// `TaskList` lookup by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activity {
+    Text(String),
+    PendingTaskUpdate { task_id: String },
+}
+
 /// Classification of JSONL line types. State-indicating lines (Progress,
 /// Assistant, System, User) drive session state; Metadata lines are skipped
 /// when scanning for state.
@@ -69,9 +82,9 @@ fn state_from_assistant(val: &Value) -> SessionState {
     }
 }
 
-pub fn detect_state_and_activity(lines: &VecDeque<String>) -> (SessionState, String) {
+pub fn detect_state_and_activity(lines: &VecDeque<String>) -> (SessionState, Activity) {
     if lines.is_empty() {
-        return (SessionState::Idle, String::new());
+        return (SessionState::Idle, Activity::Text(String::new()));
     }
 
     let parsed: Vec<Option<Value>> = lines.iter().map(|l| parse_json_line(l)).collect();
@@ -90,9 +103,9 @@ pub fn detect_state_and_activity(lines: &VecDeque<String>) -> (SessionState, Str
     let state = state_entry.map_or(SessionState::Idle, state_from_json);
 
     let activity = match state {
-        SessionState::Thinking => "thinking...".to_string(),
+        SessionState::Thinking => Activity::Text("thinking...".to_string()),
         SessionState::Working => extract_activity_from_parsed(&parsed),
-        SessionState::Idle => String::new(),
+        SessionState::Idle => Activity::Text(String::new()),
     };
 
     (state, activity)
@@ -114,7 +127,7 @@ pub fn detect_state_from_tail(file: &fs::File, file_len: u64) -> SessionState {
         .map_or(SessionState::Idle, |val| state_from_json(&val))
 }
 
-fn extract_activity_from_parsed(parsed: &[Option<Value>]) -> String {
+fn extract_activity_from_parsed(parsed: &[Option<Value>]) -> Activity {
     for val in parsed.iter().rev().flatten() {
         match classify_line(val) {
             // `progress`-type entries (hook_progress/agent_progress/
@@ -132,7 +145,7 @@ fn extract_activity_from_parsed(parsed: &[Option<Value>]) -> String {
             LineKind::System
                 if val.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary") =>
             {
-                return "compacting".to_string();
+                return Activity::Text("compacting".to_string());
             }
             LineKind::Assistant => {
                 return extract_tool_names(val);
@@ -140,23 +153,42 @@ fn extract_activity_from_parsed(parsed: &[Option<Value>]) -> String {
             _ => {}
         }
     }
-    "working".to_string()
+    Activity::Text("working".to_string())
 }
 
-fn extract_tool_names(val: &Value) -> String {
+fn extract_tool_names(val: &Value) -> Activity {
     let Some(content) = val.pointer("/message/content") else {
-        return "working".to_string();
+        return Activity::Text("working".to_string());
+    };
+    let Some(arr) = content.as_array() else {
+        return Activity::Text("working".to_string());
     };
 
-    let tools: Vec<String> = content
-        .as_array()
-        .map(|arr| arr.iter().filter_map(format_tool_use).collect())
-        .unwrap_or_default();
+    // A lone TaskUpdate call needs a further shared-TaskList lookup by id —
+    // its own tool_use input is only {taskId, status}, no human text.
+    // Scoped to the common case (TaskUpdate is the only tool call in the
+    // turn, its usual "just a status bookkeeping call" shape); a TaskUpdate
+    // mixed with other tool calls in the same turn falls through to the
+    // generic per-tool rendering below like everything else.
+    let tool_uses: Vec<&Value> = arr
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .collect();
+    if let [only] = tool_uses[..] {
+        if only.get("name").and_then(|n| n.as_str()) == Some("TaskUpdate") {
+            if let Some(task_id) = only.pointer("/input/taskId").and_then(|v| v.as_str()) {
+                return Activity::PendingTaskUpdate {
+                    task_id: task_id.to_string(),
+                };
+            }
+        }
+    }
 
+    let tools: Vec<String> = arr.iter().filter_map(format_tool_use).collect();
     if tools.is_empty() {
-        "working".to_string()
+        Activity::Text("working".to_string())
     } else {
-        tools.join(", ")
+        Activity::Text(tools.join(", "))
     }
 }
 
@@ -446,7 +478,10 @@ mod tests {
             "data": {"type": "bash_progress", "output": "running..."}
         });
         let parsed = vec![Some(tool_val), Some(progress_val)];
-        assert_eq!(extract_activity_from_parsed(&parsed), "Bash(cargo test)");
+        assert_eq!(
+            extract_activity_from_parsed(&parsed),
+            Activity::Text("Bash(cargo test)".to_string())
+        );
     }
 
     #[test]
@@ -455,7 +490,10 @@ mod tests {
             "type": "progress",
             "data": {"type": "bash_progress", "output": "stuff"}
         });
-        assert_eq!(extract_activity_from_parsed(&[Some(val)]), "working");
+        assert_eq!(
+            extract_activity_from_parsed(&[Some(val)]),
+            Activity::Text("working".to_string())
+        );
     }
 
     #[test]
@@ -470,25 +508,37 @@ mod tests {
             }
         });
         let parsed = vec![Some(tool), Some(meta.clone()), Some(meta)];
-        assert_eq!(extract_activity_from_parsed(&parsed), "Read(main.rs)");
+        assert_eq!(
+            extract_activity_from_parsed(&parsed),
+            Activity::Text("Read(main.rs)".to_string())
+        );
     }
 
     #[test]
     fn activity_fallback_working() {
         let parsed: Vec<Option<Value>> = vec![None, None];
-        assert_eq!(extract_activity_from_parsed(&parsed), "working");
+        assert_eq!(
+            extract_activity_from_parsed(&parsed),
+            Activity::Text("working".to_string())
+        );
     }
 
     #[test]
     fn activity_compact_boundary_shows_compacting() {
         let val = json!({"type": "system", "subtype": "compact_boundary"});
-        assert_eq!(extract_activity_from_parsed(&[Some(val)]), "compacting");
+        assert_eq!(
+            extract_activity_from_parsed(&[Some(val)]),
+            Activity::Text("compacting".to_string())
+        );
     }
 
     #[test]
     fn activity_other_system_subtype_falls_back_to_working() {
         let val = json!({"type": "system", "subtype": "turn_duration"});
-        assert_eq!(extract_activity_from_parsed(&[Some(val)]), "working");
+        assert_eq!(
+            extract_activity_from_parsed(&[Some(val)]),
+            Activity::Text("working".to_string())
+        );
     }
 
     // ── format_tool_use ────────────────────────────────────────────
@@ -552,6 +602,61 @@ mod tests {
     }
 
     #[test]
+    fn extract_tool_names_lone_task_update_is_pending() {
+        let val = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "42", "status": "in_progress"}}
+                ]
+            }
+        });
+        assert_eq!(
+            extract_tool_names(&val),
+            Activity::PendingTaskUpdate {
+                task_id: "42".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_task_update_mixed_with_other_tool_renders_as_text() {
+        // Not the lone-call shape TaskUpdate usually has — falls through to
+        // the generic per-tool rendering (bare "TaskUpdate" alongside it)
+        // rather than trying to resolve a lookup for just one of several
+        // tool calls in the same turn.
+        let val = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+                    {"type": "tool_use", "name": "TaskUpdate", "input": {"taskId": "42", "status": "in_progress"}}
+                ]
+            }
+        });
+        assert_eq!(
+            extract_tool_names(&val),
+            Activity::Text("Bash(ls), TaskUpdate".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_task_update_missing_task_id_falls_back_to_text() {
+        let val = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "TaskUpdate", "input": {"status": "in_progress"}}
+                ]
+            }
+        });
+        assert_eq!(
+            extract_tool_names(&val),
+            Activity::Text("TaskUpdate".to_string())
+        );
+    }
+
+    #[test]
     fn format_tool_use_non_tool() {
         let block = json!({"type": "text", "text": "hello"});
         assert!(format_tool_use(&block).is_none());
@@ -580,7 +685,10 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(extract_tool_names(&val), "Bash(ls), Read(bar.rs)");
+        assert_eq!(
+            extract_tool_names(&val),
+            Activity::Text("Bash(ls), Read(bar.rs)".to_string())
+        );
     }
 
     // ── edge cases ─────────────────────────────────────────────────
@@ -625,19 +733,28 @@ mod tests {
     #[test]
     fn extract_activity_all_unparseable() {
         let parsed: Vec<Option<Value>> = vec![None, None, None];
-        assert_eq!(extract_activity_from_parsed(&parsed), "working");
+        assert_eq!(
+            extract_activity_from_parsed(&parsed),
+            Activity::Text("working".to_string())
+        );
     }
 
     #[test]
     fn extract_activity_empty_input() {
         let parsed: Vec<Option<Value>> = vec![];
-        assert_eq!(extract_activity_from_parsed(&parsed), "working");
+        assert_eq!(
+            extract_activity_from_parsed(&parsed),
+            Activity::Text("working".to_string())
+        );
     }
 
     #[test]
     fn extract_tool_names_missing_content() {
         let val = json!({"type": "assistant", "message": {}});
-        assert_eq!(extract_tool_names(&val), "working");
+        assert_eq!(
+            extract_tool_names(&val),
+            Activity::Text("working".to_string())
+        );
     }
 
     #[test]
@@ -646,7 +763,10 @@ mod tests {
             "type": "assistant",
             "message": {"content": []}
         });
-        assert_eq!(extract_tool_names(&val), "working");
+        assert_eq!(
+            extract_tool_names(&val),
+            Activity::Text("working".to_string())
+        );
     }
 
     #[test]
@@ -655,7 +775,10 @@ mod tests {
             "type": "assistant",
             "message": {"content": [{"type": "text", "text": "hi"}]}
         });
-        assert_eq!(extract_tool_names(&val), "working");
+        assert_eq!(
+            extract_tool_names(&val),
+            Activity::Text("working".to_string())
+        );
     }
 
     // ── detect_state_from_tail ────────────────────────────────────

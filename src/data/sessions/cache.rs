@@ -276,6 +276,21 @@ impl SessionCache {
         let (session_state, act) = activity::detect_state_and_activity(&sfr.last_lines);
 
         let session_id = path.file_stem()?.to_str()?;
+        let tasks_root = dirs::home_dir().map(|home| home.join(".claude").join("tasks"));
+
+        // A TaskUpdate tool call carries no human text of its own (its input
+        // is only {taskId, status}) — resolve it with a direct by-id
+        // TaskList lookup regardless of the task's current status, unlike
+        // the activeForm override below. The whole point here is catching
+        // the task while it's still mid-transition, before its file's
+        // status even reads "in_progress" yet.
+        let act = match act {
+            activity::Activity::Text(s) => s,
+            activity::Activity::PendingTaskUpdate { task_id } => tasks_root
+                .as_deref()
+                .and_then(|root| tasks::activity_for_task_id(root, session_id, &task_id))
+                .unwrap_or_else(|| "TaskUpdate".to_string()),
+        };
         // A shared TaskList's activeForm — the same text Claude Code's own
         // status header prefers over a decorative verb — takes priority
         // over the last-tool-call reconstruction, but only while the
@@ -284,10 +299,9 @@ impl SessionCache {
         let act = if session_state == SessionState::Idle {
             act
         } else {
-            dirs::home_dir()
-                .and_then(|home| {
-                    tasks::current_task_activity(&home.join(".claude").join("tasks"), session_id)
-                })
+            tasks_root
+                .as_deref()
+                .and_then(|root| tasks::current_task_activity(root, session_id))
                 .unwrap_or(act)
         };
         let turn_runtime_secs = (session_state != SessionState::Idle)
