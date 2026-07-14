@@ -88,6 +88,27 @@ pub(crate) fn entry_timestamp(val: &serde_json::Value) -> Option<chrono::DateTim
         .map(|d| d.with_timezone(&chrono::Utc))
 }
 
+/// Whether a `"type":"user"` entry marks the start of a genuinely new turn,
+/// as opposed to a `tool_result` delivery — those are ALSO stamped
+/// `"type":"user"` (the Anthropic API's tool-result role), and a single turn
+/// can contain many of them as the assistant works through several tool
+/// calls. Claude Code's own `turnStartTime` only resets on a real new
+/// prompt, not on each `tool_result` — treating every `"user"` line as a turn
+/// boundary makes "time in current turn" reset every time a tool finishes,
+/// undercounting badly on tool-heavy turns.
+pub(crate) fn is_real_user_turn(val: &serde_json::Value) -> bool {
+    if val.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return false;
+    }
+    match val.pointer("/message/content") {
+        Some(serde_json::Value::Array(blocks)) => !blocks
+            .iter()
+            .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")),
+        Some(serde_json::Value::String(_)) => true,
+        _ => false,
+    }
+}
+
 /// Extract the teammate name from a `<teammate-message teammate_id="name@team">`
 /// tag inside a message content string.
 fn teammate_name_from_message(content: &str) -> Option<&str> {
@@ -418,6 +439,9 @@ pub struct SessionFileData {
     /// `"claude-opus-4-6"`). Empty if no assistant message was seen.
     pub model: String,
     pub(crate) tracker: AgentTracker,
+    /// Timestamp of the latest `user`-type line — "time in the current
+    /// turn", the same semantics as a subagent row's runtime.
+    pub last_user_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Seek to `seek_pos` in the file, discard the partial first line if not at
@@ -459,6 +483,10 @@ struct ScanState {
     /// if none. A session's cwd doesn't change mid-session (unlike
     /// `git_branch`), so the first one found is kept.
     cwd: String,
+    /// Timestamp of the latest `user`-type line in this scan range — "time
+    /// in the current turn" for the main session, mirroring how a
+    /// teammate's own turn-start is derived in `subagents::read_subagent_usage`.
+    last_user_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ScanState {
@@ -471,6 +499,7 @@ impl ScanState {
             model: String::new(),
             git_branch: String::new(),
             cwd: String::new(),
+            last_user_ts: None,
         }
     }
 
@@ -523,12 +552,20 @@ impl ScanState {
         // First user line's cwd — mirrors the extraction in scan_session_file
         // so an incremental scan can also recover it if the initial full scan
         // ran before any user line existed yet (a freshly-created session).
-        if self.cwd.is_empty() && val.get("type").and_then(|t| t.as_str()) == Some("user") {
+        let is_user_line = val.get("type").and_then(|t| t.as_str()) == Some("user");
+        if self.cwd.is_empty() && is_user_line {
             if let Some(cwd) = val.get("cwd").and_then(serde_json::Value::as_str) {
                 if !cwd.is_empty() {
                     self.cwd = cwd.to_string();
                 }
             }
+        }
+
+        // Latest genuine-new-turn timestamp — "time in the current turn".
+        // Tool_result deliveries are excluded (see is_real_user_turn) so a
+        // tool-heavy turn doesn't look like it keeps restarting.
+        if is_real_user_turn(val) {
+            self.last_user_ts = entry_timestamp(val).or(self.last_user_ts);
         }
 
         self.tracker.process(val);
@@ -543,6 +580,7 @@ impl ScanState {
             model: self.model,
             git_branch: self.git_branch,
             cwd: self.cwd,
+            last_user_ts: self.last_user_ts,
         }
     }
 }
@@ -590,6 +628,7 @@ pub fn scan_session_file(file: &fs::File) -> Option<SessionFileData> {
         last_lines: result.last_lines,
         model: result.model,
         tracker: result.tracker,
+        last_user_ts: result.last_user_ts,
     })
 }
 
@@ -607,6 +646,9 @@ pub struct ScanResult {
     /// none was seen (e.g. the session's first user line was already scanned
     /// in an earlier pass).
     pub cwd: String,
+    /// Timestamp of the latest `user`-type line in the scanned range; `None`
+    /// if none was seen.
+    pub last_user_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Scan a session file from `offset` to EOF. Tracks token usage, compaction
@@ -1580,6 +1622,65 @@ mod tests {
     }
 
     #[test]
+    fn is_real_user_turn_rejects_tool_result_only() {
+        let val = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}
+            ]}
+        });
+        assert!(!is_real_user_turn(&val));
+    }
+
+    #[test]
+    fn is_real_user_turn_rejects_multiple_tool_results() {
+        let val = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"},
+                {"type": "tool_result", "tool_use_id": "toolu_2", "content": "done"}
+            ]}
+        });
+        assert!(!is_real_user_turn(&val));
+    }
+
+    #[test]
+    fn is_real_user_turn_accepts_string_content() {
+        let val = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "do the next thing"}
+        });
+        assert!(is_real_user_turn(&val));
+    }
+
+    #[test]
+    fn is_real_user_turn_accepts_text_block_content() {
+        let val = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": "do the next thing"}]}
+        });
+        assert!(is_real_user_turn(&val));
+    }
+
+    #[test]
+    fn is_real_user_turn_rejects_non_user_type() {
+        let val = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "ok"}]}
+        });
+        assert!(!is_real_user_turn(&val));
+    }
+
+    #[test]
+    fn is_real_user_turn_rejects_empty_content() {
+        let val = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": []}
+        });
+        assert!(!is_real_user_turn(&val));
+    }
+
+    #[test]
     fn completed_tool_ids_exposed() {
         let val = serde_json::json!({
             "type": "user",
@@ -1724,6 +1825,81 @@ mod tests {
 
         let result = scan_from_offset(f.as_file(), 0);
         assert_eq!(result.cwd, "");
+    }
+
+    #[test]
+    fn scan_from_offset_takes_latest_user_ts() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-07-13T20:00:00.000Z","message":{{"content":"first"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-07-13T20:00:05.000Z","message":{{"content":[{{"type":"text","text":"ok"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-07-13T20:05:00.000Z","message":{{"content":"second"}}}}"#
+        )
+        .unwrap();
+        f.as_file().sync_all().unwrap();
+
+        let result = scan_from_offset(f.as_file(), 0);
+        assert_eq!(
+            result.last_user_ts.unwrap().timestamp(),
+            chrono::DateTime::parse_from_rfc3339("2026-07-13T20:05:00.000Z")
+                .unwrap()
+                .timestamp()
+        );
+    }
+
+    #[test]
+    fn scan_from_offset_tool_result_does_not_reset_turn_start() {
+        // A tool-heavy turn writes many tool_result deliveries (also
+        // "type":"user") after the real prompt — none of them should look
+        // like a newer turn start.
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-07-13T20:00:00.000Z","message":{{"content":"do the thing"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-07-13T20:00:05.000Z","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":"ls"}}}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-07-13T20:24:00.000Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}}]}}}}"#
+        )
+        .unwrap();
+        f.as_file().sync_all().unwrap();
+
+        let result = scan_from_offset(f.as_file(), 0);
+        assert_eq!(
+            result.last_user_ts.unwrap().timestamp(),
+            chrono::DateTime::parse_from_rfc3339("2026-07-13T20:00:00.000Z")
+                .unwrap()
+                .timestamp(),
+            "the tool_result 24 minutes later must not look like a new turn"
+        );
+    }
+
+    #[test]
+    fn scan_from_offset_no_user_ts_when_no_user_line() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"type":"system","subtype":"init"}}"#).unwrap();
+        f.as_file().sync_all().unwrap();
+
+        let result = scan_from_offset(f.as_file(), 0);
+        assert!(result.last_user_ts.is_none());
     }
 
     // ── property tests ────────────────────────────────────────────

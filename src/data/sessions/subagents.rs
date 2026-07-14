@@ -5,7 +5,8 @@
 
 use super::activity::detect_state_from_tail;
 use super::tail::{
-    entry_timestamp, extract_tokens, is_assistant_usage, parse_json_line, seek_tail, TeammateStatus,
+    entry_timestamp, extract_tokens, is_assistant_usage, is_real_user_turn, parse_json_line,
+    seek_tail, TeammateStatus,
 };
 use super::{ModelShort, PhaseProgress, SessionState, SubagentData};
 use crate::fmt::truncate_str;
@@ -851,7 +852,7 @@ fn read_subagent_usage(file: &fs::File, file_len: u64) -> TailStats {
         let Some(val) = parse_json_line(&line) else {
             continue;
         };
-        if val.get("type").and_then(|t| t.as_str()) == Some("user") {
+        if is_real_user_turn(&val) {
             stats.last_user_ts = entry_timestamp(&val).or(stats.last_user_ts);
         }
         if !is_assistant_usage(&val) {

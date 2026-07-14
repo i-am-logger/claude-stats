@@ -299,6 +299,12 @@ fn render_state_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
     let mut spans = Vec::new();
     if !session.activity.is_empty() {
         spans.push(Span::styled(&session.activity, Style::default().fg(sc)));
+        if let Some(runtime) = session.turn_runtime_secs {
+            spans.push(Span::styled(
+                format!(" · {}", format_runtime(runtime)),
+                Style::default().fg(DIM),
+            ));
+        }
     }
     if !session.agents.is_empty() {
         if !spans.is_empty() {
@@ -416,6 +422,7 @@ mod tests {
             last_activity_label: "5s ago".into(),
             state,
             activity: "Bash(ls)".into(),
+            turn_runtime_secs: None,
         }
     }
 
@@ -719,6 +726,23 @@ mod tests {
         session.compactions = 3;
         let text = render_to_text(&[session], 80, 12);
         assert!(text.contains("3x compacted"));
+    }
+
+    #[test]
+    fn render_turn_runtime_shown_next_to_activity() {
+        let mut session = make_session(0, SessionState::Working);
+        session.turn_runtime_secs = Some(762);
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("Bash(ls) · 12m 42s"));
+    }
+
+    #[test]
+    fn render_no_turn_runtime_when_idle() {
+        let mut session = make_session(0, SessionState::Idle);
+        session.turn_runtime_secs = Some(762);
+        session.activity = String::new();
+        let text = render_to_text(&[session], 100, 12);
+        assert!(!text.contains("12m 42s"));
     }
 
     #[test]

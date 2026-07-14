@@ -99,4 +99,8 @@ pub struct SessionData {
     pub last_activity_label: String,
     pub state: SessionState,
     pub activity: String,
+    /// Seconds since the session's current turn started (the latest `user`
+    /// entry) — "time in the current turn", the same semantics already used
+    /// for subagent/teammate rows. `None` when idle or unknown.
+    pub turn_runtime_secs: Option<u64>,
 }

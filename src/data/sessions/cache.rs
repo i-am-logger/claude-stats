@@ -23,6 +23,7 @@ struct CachedEntry {
     bytes_read: u64,
     tracker: tail::AgentTracker,
     model: String,
+    last_user_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl CachedEntry {
@@ -36,6 +37,7 @@ impl CachedEntry {
             bytes_read: file_len,
             tracker: data.tracker,
             model: data.model,
+            last_user_ts: data.last_user_ts,
         }
     }
 }
@@ -50,6 +52,7 @@ struct SessionFileResult {
     compactions: u32,
     last_lines: VecDeque<String>,
     model: String,
+    last_user_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Caches session file state across polls. First encounter does a full read;
@@ -202,6 +205,7 @@ impl SessionCache {
             compactions: cached.compactions,
             last_lines: cached.last_lines.clone(),
             model: cached.model.clone(),
+            last_user_ts: cached.last_user_ts,
         }
     }
 
@@ -242,6 +246,11 @@ impl SessionCache {
                     if cached.cwd.is_empty() && !result.cwd.is_empty() {
                         cached.cwd = result.cwd;
                     }
+                    // Unlike cwd, a fresh last_user_ts always wins — it's
+                    // by definition later than anything already cached.
+                    if result.last_user_ts.is_some() {
+                        cached.last_user_ts = result.last_user_ts;
+                    }
                     Some(Self::result_from_cache(cached))
                 }
                 std::cmp::Ordering::Equal => Some(Self::result_from_cache(cached)),
@@ -281,6 +290,15 @@ impl SessionCache {
                 })
                 .unwrap_or(act)
         };
+        let turn_runtime_secs = (session_state != SessionState::Idle)
+            .then_some(sfr.last_user_ts)
+            .flatten()
+            .map(|start| {
+                (chrono::Utc::now() - start)
+                    .num_seconds()
+                    .max(0)
+                    .cast_unsigned()
+            });
 
         // Always check for active subagents — background agents keep running
         // even after the parent conversation turn finishes (Idle state).
@@ -326,6 +344,7 @@ impl SessionCache {
             last_activity_label,
             state: session_state,
             activity: act,
+            turn_runtime_secs,
         })
     }
 
@@ -520,6 +539,44 @@ mod tests {
             .read_session_file(f.path(), f.as_file(), new_len)
             .unwrap();
         assert_eq!(second.cwd, "/home/user/late-project");
+    }
+
+    #[test]
+    fn incremental_scan_advances_last_user_ts() {
+        let first_line = r#"{"type":"user","cwd":"/tmp/p","timestamp":"2026-07-13T20:00:00.000Z","message":{"content":"go"}}"#;
+        let f = jsonl_file(&[first_line]);
+        let file_len = f.as_file().metadata().unwrap().len();
+
+        let mut cache = SessionCache::new();
+        let first = cache
+            .read_session_file(f.path(), f.as_file(), file_len)
+            .unwrap();
+        assert_eq!(
+            first.last_user_ts.unwrap().timestamp(),
+            chrono::DateTime::parse_from_rfc3339("2026-07-13T20:00:00.000Z")
+                .unwrap()
+                .timestamp()
+        );
+
+        let mut file = f.as_file();
+        file.seek(SeekFrom::End(0)).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","cwd":"/tmp/p","timestamp":"2026-07-13T20:10:00.000Z","message":{{"content":"next"}}}}"#
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        let new_len = file.metadata().unwrap().len();
+
+        let second = cache
+            .read_session_file(f.path(), f.as_file(), new_len)
+            .unwrap();
+        assert_eq!(
+            second.last_user_ts.unwrap().timestamp(),
+            chrono::DateTime::parse_from_rfc3339("2026-07-13T20:10:00.000Z")
+                .unwrap()
+                .timestamp()
+        );
     }
 
     // ── SessionCache integration ──────────────────────────────────
@@ -1158,6 +1215,7 @@ mod tests {
             last_activity_label: String::new(),
             state: SessionState::Idle,
             activity: String::new(),
+            turn_runtime_secs: None,
         }
     }
 
