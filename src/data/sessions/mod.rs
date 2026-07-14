@@ -49,6 +49,18 @@ impl std::fmt::Display for ModelShort {
     }
 }
 
+/// A workflow run's declared phase and the agents observed in it so far.
+///
+/// `done` agents with `state == "done"` out of `total` agents assigned to
+/// this phase's title. `total == 0` means the workflow hasn't dispatched any
+/// agent into this phase yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseProgress {
+    pub title: String,
+    pub done: u32,
+    pub total: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubagentData {
     pub task: String,
@@ -66,6 +78,10 @@ pub struct SubagentData {
     /// For rows that aggregate a whole workflow run: `(done, total)` agent
     /// counts. `None` for individual agents.
     pub progress: Option<(u32, u32)>,
+    /// Declared `meta.phases` breakdown for workflow runs, in declaration
+    /// order. Empty for plain agents and for workflow runs that don't
+    /// declare phases.
+    pub phases: Vec<PhaseProgress>,
     /// Used for display only; active/completed filtering uses parent JSONL tracking.
     pub state: SessionState,
 }

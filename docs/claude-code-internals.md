@@ -1,6 +1,6 @@
 # Claude Code internals: sessions, agents, teams, workflows — on-disk reference
 
-Reference for claude-stats scanner development. Sources: extracted strings from the Claude Code bundle (v2.1.205, `GIT_SHA 4cf2699a`; minified identifiers cited in brackets for cross-reference against future extractions) plus live-state verification of `~/.claude` written by v2.1.198–2.1.205. Facts marked **[live]** were confirmed on disk; facts marked **UNCERTAIN** were not.
+Reference for claude-stats scanner development. Sources: extracted strings from the Claude Code bundle (v2.1.205, `GIT_SHA 4cf2699a`; minified identifiers cited in brackets for cross-reference against future extractions) plus live-state verification of `~/.claude` written by v2.1.198–2.1.205. Facts marked **[live]** were confirmed on disk; facts marked **UNCERTAIN** were not. §7.1's `workflowProgress`/task-output findings were added later, verified against v2.1.207 (binary string search + a real polled 2-phase probe run).
 
 ---
 
@@ -164,6 +164,17 @@ lead `shutdown_request` → teammate model approves via SendMessage `shutdown_re
 - Elapsed = `now − (turnStartTime ?? startTime)` — **time in the current turn** (turnStartTime resets each turn); finished rows show `endTime − startTime`.
 - Token chip = `latestInputTokens (input+cache_creation+cache_read of latest assistant msg) + cumulative output_tokens across the run`; `↓` merely means "recent tool activity recorded".
 
+### 5.6 The idle/active flip — two mechanisms, one on disk
+
+The roster's "idle" vs "working" state is **not** a single flag claude-stats can read directly. There are two independent implementations depending on backend, discovered via binary string search against v2.1.207 (`grep`-able JS identifiers cited in brackets):
+
+- **In-process (default) teammates**: `tasks[id].isIdle`, a boolean on the **in-memory task registry** inside the running CLI process. Cleared (`isIdle:false`) at the start of every new turn (the `[inProcessRunner]` per-turn loop's first statement, alongside `status:"running"` and a fresh `turnStartTime`); set (`isIdle:true`) at turn end, which also fires `onIdleCallbacks` and sends the `idle_notification` mailbox message. **This flag is never persisted to disk** — there is no file claude-stats (an out-of-process scanner) can read it from, for the common case that covers every teammate observed live in this repo's sessions.
+- **Out-of-process (tmux/iTerm2) teammates**: `member.isActive` in `teams/<team>/config.json` [`setMemberActive`], flipped `true` at the top of the teammate's own query-submit handler and `false` from a registered `Stop` hook (same moment the `idle_notification` fires) or on failure. This one *is* on disk, but only applies to the pane-backed backend, not in-process.
+
+**Consequence for claude-stats**: since the authoritative in-process flag is unreadable, claude-stats' own approximation — the `idle_notification` mailbox message relayed into the parent JSONL — is the *only* signal available, and it has a real staleness problem: per §5.3, that relay only happens once the lead itself goes idle, so delivery can lag **minutes** behind the real transition. A teammate can go idle, get a new mailbox message, and resume actual work (writing new `user`/`assistant` turns to its own transcript) well before its *first* `idle_notification` is even delivered — live-verified with real timestamps: a 44-minute relay lag on one delivery, during which the teammate had already resumed and completed a whole new turn. **Fix applied**: `parse_teammate` (`subagents.rs`) no longer lets a `status.is_idle()==true` verdict override the state independently computed from the teammate's own transcript tail (`detect_state_from_tail`) — that tail read is the fresher, more reliable signal whenever the two disagree. The `is_idle()` mailbox-notification signal is now only trusted for the tight 30s roster-hide window (`TEAMMATE_IDLE_HIDE_SECS`) when the transcript tail *also* independently reads as idle.
+
+Separately: because delivery only happens while the lead is idle, **several different teammates' notifications can batch into one relayed JSONL entry** as multiple concatenated `<teammate-message>` blocks (live-observed: 10 idle notifications from 5 teammates in one entry). Each block must be parsed independently — extracting `teammate_id`/`timestamp` from the whole concatenated string only ever finds the *first* block's values.
+
 ---
 
 ## 6. Shared task lists (`~/.claude/tasks/<listId>/`)
@@ -180,7 +191,10 @@ lead `shutdown_request` → teammate model approves via SendMessage `shutdown_re
 - Script persisted to `<proj>/<sessionId>/workflows/scripts/<slug>-<runId>.js` (slug: lowercase, `[^a-z0-9]+`→`-`).
 - Run dir `<proj>/<sessionId>/subagents/workflows/<runId>/`: `journal.jsonl` + `agent-<id>.jsonl` transcripts.
 - **Snapshot on completion**: `<proj>/<sessionId>/workflows/<runId>.json` with `{runId, timestamp, taskId, script, scriptPath, args, result, agentCount, logs, durationMs, error, summary, workflowName, title, status, startTime, phases, defaultModel, workflowProgress, totalTokens, totalToolCalls}`. Reader defaults `status ?? (error ? "failed" : "completed")`. The `/workflows` browser lists these — completed runs outlive the roster.
-- Task `.output` file also written on completion.
+- Task `.output` file: `/tmp/claude-<uid>/<proj>/<sessionId>/tasks/<taskId>.output` (taskId comes from the launch event, §2.6). **[live, empirically confirmed]** Written *during* the run, not only on completion — polled at 1.5 s intervals against a live 2-agent/2-phase run, the file held complete `workflowProgress` data (both agents `state:"done"`) a full ~9 s before the task's terminal `<task-notification>` fired. Same top-level shape as the snapshot's `workflowProgress`/`totalTokens`/`agentCount`, but no `status`/`workflowName` keys; also carries `result`/`logs` (the agents' full output — can be tens of KB+, don't deserialize into a struct that keeps them). This is the only source for a still-running run's phase breakdown — the completion snapshot doesn't exist yet.
+- `workflowProgress` (present in both the file above and the completion snapshot) is an array of two entry shapes:
+  - `{type:"workflow_phase", index, title}` — one per `meta.phases` entry, in declaration order.
+  - `{type:"workflow_agent", index, label, phaseIndex, phaseTitle, agentId, model, state, startedAt, queuedAt, attempt, lastToolName?, lastToolSummary?, lastProgressAt, tokens, toolCalls, durationMs, promptPreview, resultPreview}` — one per dispatched agent (including respawns — dedupe the way §7.2 dedupes journal keys if that matters to a consumer). `state` seen so far: `"done"`; other values (running/queued/error) presumed but not directly observed. Runs with no declared `meta.phases` have no `workflow_phase` entries and agents carry null `phaseIndex`/`phaseTitle`.
 
 ### 7.2 `journal.jsonl`
 
@@ -235,3 +249,5 @@ No single file — three-part composition (this is what the internal ListAgents 
 - `wf-\d+` agent-id form's emitter.
 - The exact hollow-circle glyph (`Be.circle`) is platform-dependent.
 - Which CC version dropped persisted `progress` entries (they are gone in 2.1.198+; the routing policy for them still exists).
+- Full `workflow_agent.state` vocabulary in `workflowProgress` — only `"done"` has been directly observed; running/queued/error states are presumed to exist (the roster clearly distinguishes them, §7.3) but weren't captured live.
+- Whether the task-output file is deleted/truncated after the run's completion snapshot is written, or left in place indefinitely.

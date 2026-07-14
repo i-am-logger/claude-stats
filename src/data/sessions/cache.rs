@@ -237,6 +237,11 @@ impl SessionCache {
                     if !result.git_branch.is_empty() {
                         cached.git_branch = result.git_branch;
                     }
+                    // cwd doesn't change mid-session — only fill it in if the
+                    // initial full scan ran before any user line existed yet.
+                    if cached.cwd.is_empty() && !result.cwd.is_empty() {
+                        cached.cwd = result.cwd;
+                    }
                     Some(Self::result_from_cache(cached))
                 }
                 std::cmp::Ordering::Equal => Some(Self::result_from_cache(cached)),
@@ -266,7 +271,7 @@ impl SessionCache {
         let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
         let active_ids = self.update_agent_tracking(path);
-        let (completed_tool_ids, teammates, workflow_names) = self
+        let (completed_tool_ids, teammates, workflow_names, workflow_task_ids) = self
             .entries
             .get(path)
             .map(|cached| {
@@ -274,6 +279,7 @@ impl SessionCache {
                     cached.tracker.completed_tool_ids().clone(),
                     cached.tracker.teammates().clone(),
                     cached.tracker.workflow_names().clone(),
+                    cached.tracker.workflow_task_ids().clone(),
                 )
             })
             .unwrap_or_default();
@@ -283,6 +289,7 @@ impl SessionCache {
             &completed_tool_ids,
             &teammates,
             &workflow_names,
+            &workflow_task_ids,
         );
 
         let context_window = tail::context_window_for_model(&sfr.model);
@@ -465,6 +472,40 @@ mod tests {
             .read_session_file(f.path(), f.as_file(), new_len)
             .unwrap();
         assert_eq!(second.git_branch, "feat/new");
+    }
+
+    #[test]
+    fn incremental_scan_recovers_cwd_missing_from_initial_scan() {
+        // The first `user` line can carry an empty `cwd` (e.g. cwd detection
+        // failed at that moment) — the full scan caches it as "" verbatim
+        // (scan_session_file only bails out entirely when NO user line
+        // exists at all, not when one exists with an empty cwd). The title
+        // must not stay permanently blank once a later line reveals a real
+        // cwd.
+        let empty_cwd_line = r#"{"type":"user","cwd":"","message":{"content":"hi"}}"#;
+        let f = jsonl_file(&[empty_cwd_line]);
+        let file_len = f.as_file().metadata().unwrap().len();
+
+        let mut cache = SessionCache::new();
+        let first = cache
+            .read_session_file(f.path(), f.as_file(), file_len)
+            .unwrap();
+        assert_eq!(first.cwd, "");
+
+        let mut file = f.as_file();
+        file.seek(SeekFrom::End(0)).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","cwd":"/home/user/late-project","gitBranch":"main","message":{{"content":"hi"}}}}"#
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        let new_len = file.metadata().unwrap().len();
+
+        let second = cache
+            .read_session_file(f.path(), f.as_file(), new_len)
+            .unwrap();
+        assert_eq!(second.cwd, "/home/user/late-project");
     }
 
     // ── SessionCache integration ──────────────────────────────────
@@ -841,7 +882,7 @@ mod tests {
         f.as_file().seek(SeekFrom::Start(0)).unwrap();
         let idle = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}}"#;
         writeln!(&f, "{user_line}").unwrap();
-        writeln!(&f, "{}", &assistant_usage_line(5_000)).unwrap();
+        writeln!(&f, "{}", assistant_usage_line(5_000)).unwrap();
         writeln!(&f, "{idle}").unwrap();
         f.as_file().sync_all().unwrap();
 

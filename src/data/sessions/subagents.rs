@@ -7,12 +7,12 @@ use super::activity::detect_state_from_tail;
 use super::tail::{
     entry_timestamp, extract_tokens, is_assistant_usage, parse_json_line, seek_tail, TeammateStatus,
 };
-use super::{ModelShort, SessionState, SubagentData};
+use super::{ModelShort, PhaseProgress, SessionState, SubagentData};
 use crate::fmt::truncate_str;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Hide workflow-run agents whose transcript hasn't been written for this
 /// long. A crashed or killed run never writes its `result` journal lines, so
@@ -40,9 +40,11 @@ pub(crate) const RUN_DONE_LINGER_SECS: u64 = 30;
 /// ids with a `tool_result` (finishing synchronous agents, joined via their
 /// meta.json `toolUseId`). `teammates` maps named-teammate lifecycle
 /// statuses observed in the parent JSONL. `workflow_names` maps workflow
-/// `runId` to its human name, captured from the parent JSONL's launch event
-/// (available before the run's script/snapshot are). Workflow runs under
-/// `subagents/workflows/<run-id>/` aggregate into a single row each.
+/// `runId` to its human name, and `workflow_task_ids` maps `runId` to its
+/// `taskId` (used to locate the run's live progress file) — both captured
+/// from the parent JSONL's launch event, available before the run's
+/// script/snapshot are. Workflow runs under `subagents/workflows/<run-id>/`
+/// aggregate into a single row each.
 #[allow(
     clippy::implicit_hasher,
     reason = "internal API, always called with std collections"
@@ -53,10 +55,15 @@ pub fn scan_subagents(
     completed_tool_ids: &HashSet<String>,
     teammates: &HashMap<String, TeammateStatus>,
     workflow_names: &HashMap<String, String>,
+    workflow_task_ids: &HashMap<String, String>,
 ) -> Vec<SubagentData> {
     let mut agents = collect_agents(subagents_dir, active_ids, completed_tool_ids, teammates);
 
-    agents.extend(scan_workflow_runs(subagents_dir, workflow_names));
+    agents.extend(scan_workflow_runs(
+        subagents_dir,
+        workflow_names,
+        workflow_task_ids,
+    ));
 
     dedup_teammates(&mut agents);
 
@@ -187,18 +194,30 @@ fn parse_teammate(
         return None;
     }
 
-    if status.is_idle() {
+    if status.is_idle() && data.state == SessionState::Idle {
         // Idle means "available", not terminated — keep the roster row while
-        // the transcript is fresh, drop it once it goes quiet.
+        // the transcript is fresh, drop it once it goes quiet. Both signals
+        // agree here (the idle_notification AND the teammate's own
+        // transcript tail, which independently reads as a finished turn) —
+        // safe to apply the tight hide window.
         if data.last_write_age_secs > TEAMMATE_IDLE_HIDE_SECS {
             return None;
         }
-        data.state = SessionState::Idle;
     } else if data.last_write_age_secs > AGENT_STALE_SECS {
-        // Spawned but never sent an idle notification, and the transcript has
-        // been quiet far longer than any model turn — abandoned or killed.
+        // Either genuinely active (never sent an idle notification, or the
+        // transcript tail shows fresh work — see below), or a stale/absent
+        // idle signal and the transcript has been quiet far longer than any
+        // real model turn — abandoned or killed.
         return None;
     }
+    // Deliberately NOT forcing `data.state = Idle` when `status.is_idle()` is
+    // true but the transcript tail (`detect_state_from_tail`, already
+    // computed into `data.state` by `parse_subagent` above) disagrees:
+    // `idle_notification` delivery into the parent JSONL can lag minutes
+    // behind (it only lands once the lead itself goes idle), so a teammate
+    // that resumed via a new mailbox message and is actively mid-turn right
+    // now can still be carrying a stale `is_idle()==true` latch — the
+    // transcript tail is the fresher, more reliable signal in that case.
     // The meta.json name wins, but the tracker name fills any gap.
     data.name.get_or_insert_with(|| name.to_string());
     // Claude Code's roster shows time-in-current-turn: elapsed since the last
@@ -230,6 +249,7 @@ fn parse_teammate(
 fn scan_workflow_runs(
     subagents_dir: &Path,
     workflow_names: &HashMap<String, String>,
+    workflow_task_ids: &HashMap<String, String>,
 ) -> Vec<SubagentData> {
     let Ok(runs) = fs::read_dir(subagents_dir.join("workflows")) else {
         return Vec::new();
@@ -251,9 +271,61 @@ fn scan_workflow_runs(
             if !dir_recently_written(&run_dir, AGENT_STALE_SECS) {
                 return None;
             }
-            parse_workflow_run(&run_dir, scripts_dir.as_deref(), workflow_names)
+            parse_workflow_run(
+                &run_dir,
+                scripts_dir.as_deref(),
+                subagents_dir,
+                workflow_names,
+                workflow_task_ids,
+            )
         })
         .collect()
+}
+
+/// One entry of a workflow run's `workflowProgress` array — Claude Code's own
+/// phase-tracking data, present both in the completion snapshot and in the
+/// live task-output file. Two entry shapes share this type: `workflow_phase`
+/// (`title`, declaration order) and `workflow_agent` (`phaseTitle`, `state`).
+/// Unrecognized/absent fields are left `None` rather than erroring — this is
+/// live telemetry, not a stable public API.
+#[derive(Debug, serde::Deserialize)]
+struct ProgressEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    title: Option<String>,
+    #[serde(rename = "phaseTitle")]
+    phase_title: Option<String>,
+    state: Option<String>,
+}
+
+/// Reduce a run's raw `workflowProgress` entries to per-phase done/total
+/// counts, in the phases' declaration order. Agents whose `phaseTitle`
+/// doesn't match a declared phase (or is absent — runs with no `meta.phases`)
+/// are dropped: callers treat an empty result as "no phase breakdown",
+/// falling back to the flat `done/total agents done` display.
+fn derive_phases(entries: &[ProgressEntry]) -> Vec<PhaseProgress> {
+    let mut phases: Vec<PhaseProgress> = entries
+        .iter()
+        .filter(|e| e.kind == "workflow_phase")
+        .filter_map(|e| e.title.clone())
+        .map(|title| PhaseProgress {
+            title,
+            done: 0,
+            total: 0,
+        })
+        .collect();
+    for entry in entries.iter().filter(|e| e.kind == "workflow_agent") {
+        let Some(phase_title) = &entry.phase_title else {
+            continue;
+        };
+        if let Some(phase) = phases.iter_mut().find(|p| &p.title == phase_title) {
+            phase.total += 1;
+            if entry.state.as_deref() == Some("done") {
+                phase.done += 1;
+            }
+        }
+    }
+    phases
 }
 
 /// Run snapshot written to `<session>/workflows/<run-id>.json` when a
@@ -266,12 +338,97 @@ struct RunSnapshot {
     workflow_name: Option<String>,
     #[serde(rename = "totalTokens")]
     total_tokens: Option<u64>,
+    #[serde(rename = "workflowProgress", default)]
+    workflow_progress: Vec<ProgressEntry>,
+}
+
+/// Live progress file Claude Code polls background/workflow tasks through
+/// (`AgentOutput.outputFile`), updated incrementally while a workflow runs —
+/// unlike the completion snapshot, this exists and is current *during* the
+/// run. Only `workflowProgress` is read; the file also carries `result`/
+/// `logs` (the agents' full output, can be very large) which are left
+/// undeclared here so serde discards them without allocating.
+#[derive(Debug, serde::Deserialize)]
+struct TaskOutputProgress {
+    #[serde(rename = "workflowProgress", default)]
+    workflow_progress: Vec<ProgressEntry>,
+}
+
+/// Find `run_id`'s live task-output file under
+/// `<tmp_dir>/claude-*/<proj>/<session_id>/tasks/<task_id>.output`. `tmp_dir`
+/// is injected (production passes `std::env::temp_dir()`) so this stays
+/// testable without touching the real `/tmp`.
+fn find_task_output(
+    tmp_dir: &Path,
+    proj: &str,
+    session_id: &str,
+    task_id: &str,
+) -> Option<PathBuf> {
+    let entries = fs::read_dir(tmp_dir).ok()?;
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("claude-"))
+        })
+        .find_map(|root| {
+            let candidate = root
+                .join(proj)
+                .join(session_id)
+                .join("tasks")
+                .join(format!("{task_id}.output"));
+            candidate.is_file().then_some(candidate)
+        })
+}
+
+/// Derive `(proj, sessionId)` from a session's `subagents/` dir path
+/// (`.../<proj>/<sessionId>/subagents`), for locating that session's temp
+/// dir (`/tmp/claude-<uid>/<proj>/<sessionId>/`).
+fn proj_and_session(subagents_dir: &Path) -> Option<(&str, &str)> {
+    let session_dir = subagents_dir.parent()?;
+    let session_id = session_dir.file_name()?.to_str()?;
+    let proj = session_dir.parent()?.file_name()?.to_str()?;
+    Some((proj, session_id))
+}
+
+/// Read a live run's phase progress from its task-output file, given the
+/// session's `subagents/` dir and the run's `runId`. Empty if the run's
+/// `taskId` was never observed (e.g. this session's launch event predates
+/// `taskId` being present), the temp file can't be located, or it doesn't
+/// parse — this is best-effort live telemetry, not the source of truth (the
+/// completion snapshot is, once a run finishes).
+fn read_live_phases(
+    tmp_dir: &Path,
+    subagents_dir: &Path,
+    workflow_task_ids: &HashMap<String, String>,
+    run_id: &str,
+) -> Vec<PhaseProgress> {
+    let Some(task_id) = workflow_task_ids.get(run_id) else {
+        return Vec::new();
+    };
+    let Some((proj, session_id)) = proj_and_session(subagents_dir) else {
+        return Vec::new();
+    };
+    let Some(output_path) = find_task_output(tmp_dir, proj, session_id, task_id) else {
+        return Vec::new();
+    };
+    let Ok(data) = fs::read_to_string(output_path) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<TaskOutputProgress>(&data) else {
+        return Vec::new();
+    };
+    derive_phases(&parsed.workflow_progress)
 }
 
 fn parse_workflow_run(
     run_dir: &Path,
     scripts_dir: Option<&Path>,
+    subagents_dir: &Path,
     workflow_names: &HashMap<String, String>,
+    workflow_task_ids: &HashMap<String, String>,
 ) -> Option<SubagentData> {
     let journal = fs::File::open(run_dir.join("journal.jsonl")).ok()?;
     // Count by cache KEY, not agentId: stall/throttle respawns append extra
@@ -343,6 +500,28 @@ fn parse_workflow_run(
         .and_then(|s| s.status.as_deref())
         .is_some_and(|s| s == "failed");
 
+    // The completion snapshot's phase breakdown is authoritative once it
+    // exists; a still-running workflow has no snapshot yet, so fall back to
+    // its live task-output file. A terminal run without snapshot phase data
+    // (e.g. no `meta.phases` declared) has none to fall back to — it's about
+    // to evict anyway.
+    let snapshot_phases = snapshot
+        .as_ref()
+        .map(|s| derive_phases(&s.workflow_progress))
+        .unwrap_or_default();
+    let phases = if !snapshot_phases.is_empty() {
+        snapshot_phases
+    } else if terminal {
+        Vec::new()
+    } else {
+        read_live_phases(
+            &std::env::temp_dir(),
+            subagents_dir,
+            workflow_task_ids,
+            run_id,
+        )
+    };
+
     Some(SubagentData {
         task: if failed {
             "failed".to_string()
@@ -364,6 +543,7 @@ fn parse_workflow_run(
             SessionState::Working
         },
         progress: Some((done, total)),
+        phases,
     })
 }
 
@@ -500,7 +680,7 @@ struct TeamMember {
     joined_at: Option<i64>,
 }
 
-fn default_teams_dir() -> Option<std::path::PathBuf> {
+fn default_teams_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".claude").join("teams"))
 }
 
@@ -586,6 +766,7 @@ fn parse_subagent(path: &Path) -> Option<(SubagentData, Option<chrono::DateTime<
             last_write_age_secs,
             state,
             progress: None,
+            phases: Vec::new(),
         },
         tail_stats.last_user_ts,
     ))
@@ -714,7 +895,6 @@ fn parse_model(model: &str) -> ModelShort {
 mod tests {
     use super::*;
     use crate::data::sessions::testutil::write_agent_file;
-    use std::path::PathBuf;
 
     #[test]
     fn parse_model_fable() {
@@ -767,6 +947,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 2);
         let tasks: Vec<&str> = agents.iter().map(|a| a.task.as_str()).collect();
@@ -787,6 +968,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(agents.is_empty());
     }
@@ -798,6 +980,7 @@ mod tests {
             Path::new("/nonexistent/dir/subagents"),
             &active,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -816,6 +999,7 @@ mod tests {
             dir.path(),
             &active,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -858,6 +1042,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         let run = &agents[0];
@@ -884,6 +1069,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-flow"));
@@ -904,6 +1090,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &workflow_names,
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("review-changes"));
@@ -930,6 +1117,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &workflow_names,
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("review-changes"));
@@ -946,6 +1134,7 @@ mod tests {
             dir.path(),
             &active,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -969,6 +1158,7 @@ mod tests {
             dir.path(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -998,6 +1188,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].progress, Some((2, 2)));
@@ -1013,8 +1204,217 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(agents.is_empty());
+    }
+
+    // ── workflow phases ──────────────────────────────────────────
+
+    #[test]
+    fn derive_phases_groups_agents_by_phase_title_in_declaration_order() {
+        let entries: Vec<ProgressEntry> = serde_json::from_str(
+            r#"[
+                {"type":"workflow_phase","index":1,"title":"Find"},
+                {"type":"workflow_phase","index":2,"title":"Verify"},
+                {"type":"workflow_agent","index":1,"phaseTitle":"Find","state":"done"},
+                {"type":"workflow_agent","index":2,"phaseTitle":"Find","state":"done"},
+                {"type":"workflow_agent","index":3,"phaseTitle":"Verify","state":"running"}
+            ]"#,
+        )
+        .unwrap();
+        let phases = derive_phases(&entries);
+        assert_eq!(
+            phases,
+            vec![
+                PhaseProgress {
+                    title: "Find".into(),
+                    done: 2,
+                    total: 2
+                },
+                PhaseProgress {
+                    title: "Verify".into(),
+                    done: 0,
+                    total: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_phases_ignores_agents_with_no_declared_phase() {
+        // No `workflow_phase` entries at all — a run whose script declares
+        // no `meta.phases`. Agents carry no `phaseTitle` to match against.
+        let entries: Vec<ProgressEntry> =
+            serde_json::from_str(r#"[{"type":"workflow_agent","index":1,"state":"done"}]"#)
+                .unwrap();
+        assert!(derive_phases(&entries).is_empty());
+    }
+
+    #[test]
+    fn find_task_output_locates_file_under_claude_prefixed_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_root = tmp.path().join("claude-1000");
+        let task_dir = claude_root.join("my-proj").join("sess-1").join("tasks");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("w1.output"), "{}").unwrap();
+
+        let found = find_task_output(tmp.path(), "my-proj", "sess-1", "w1");
+        assert_eq!(found, Some(task_dir.join("w1.output")));
+    }
+
+    #[test]
+    fn find_task_output_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("claude-1000")).unwrap();
+        assert_eq!(
+            find_task_output(tmp.path(), "my-proj", "sess-1", "w1"),
+            None
+        );
+    }
+
+    #[test]
+    fn scan_subagents_workflow_run_phases_from_terminal_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let subagents_dir = root.path().join("subagents");
+        let run_dir = write_workflow_run(&subagents_dir, "wf_abc123");
+        // Balance the journal so the run is terminal.
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            concat!(
+                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"wf1\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"wf1\",\"result\":\"ok\"}\n",
+                "{\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"wf2\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k2\",\"agentId\":\"wf2\",\"result\":\"ok\"}\n",
+            ),
+        )
+        .unwrap();
+        let workflows_dir = root.path().join("workflows");
+        fs::create_dir_all(&workflows_dir).unwrap();
+        fs::write(
+            workflows_dir.join("wf_abc123.json"),
+            r#"{
+                "status": "completed",
+                "workflowName": "review-changes",
+                "totalTokens": 5000,
+                "workflowProgress": [
+                    {"type":"workflow_phase","index":1,"title":"Find"},
+                    {"type":"workflow_phase","index":2,"title":"Verify"},
+                    {"type":"workflow_agent","index":1,"phaseTitle":"Find","state":"done"},
+                    {"type":"workflow_agent","index":2,"phaseTitle":"Verify","state":"done"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let agents = scan_subagents(
+            &subagents_dir,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(
+            agents[0].phases,
+            vec![
+                PhaseProgress {
+                    title: "Find".into(),
+                    done: 1,
+                    total: 1
+                },
+                PhaseProgress {
+                    title: "Verify".into(),
+                    done: 1,
+                    total: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_subagents_workflow_run_phases_from_live_output() {
+        // No completion snapshot — the run is still in progress (write_workflow_run's
+        // journal has wf1 done, wf2 only started). Phase data must come from the
+        // live task-output file under /tmp/claude-*/<proj>/<sessionId>/tasks/<taskId>.output.
+        let root = tempfile::tempdir().unwrap();
+        let subagents_dir = root
+            .path()
+            .join("live-proj")
+            .join("live-session")
+            .join("subagents");
+        write_workflow_run(&subagents_dir, "wf_abc123");
+
+        let claude_tmp = tempfile::Builder::new()
+            .prefix("claude-")
+            .tempdir()
+            .unwrap();
+        let task_dir = claude_tmp
+            .path()
+            .join("live-proj")
+            .join("live-session")
+            .join("tasks");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(
+            task_dir.join("w-live-task.output"),
+            r#"{
+                "workflowProgress": [
+                    {"type":"workflow_phase","index":1,"title":"Design"},
+                    {"type":"workflow_phase","index":2,"title":"Review"},
+                    {"type":"workflow_agent","index":1,"phaseTitle":"Design","state":"done"},
+                    {"type":"workflow_agent","index":2,"phaseTitle":"Review","state":"running"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let workflow_task_ids: HashMap<String, String> =
+            [("wf_abc123".to_string(), "w-live-task".to_string())].into();
+
+        let agents = scan_subagents(
+            &subagents_dir,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &workflow_task_ids,
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].state, SessionState::Working);
+        assert_eq!(
+            agents[0].phases,
+            vec![
+                PhaseProgress {
+                    title: "Design".into(),
+                    done: 1,
+                    total: 1
+                },
+                PhaseProgress {
+                    title: "Review".into(),
+                    done: 0,
+                    total: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_subagents_live_workflow_without_task_id_has_no_phases() {
+        // No entry in workflow_task_ids for this run_id at all — the launch
+        // event predates `taskId` or wasn't observed yet.
+        let dir = tempfile::tempdir().unwrap();
+        write_workflow_run(dir.path(), "wf_abc123");
+
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+        assert!(agents[0].phases.is_empty());
     }
 
     // ── teammates ────────────────────────────────────────────────
@@ -1053,6 +1453,7 @@ mod tests {
             &HashSet::new(),
             &teammates,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-fixer"));
@@ -1075,9 +1476,42 @@ mod tests {
             &HashSet::new(),
             &teammates,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn scan_subagents_idle_teammate_resumed_shows_working() {
+        // The idle_notification latch (`status.is_idle()`) can be stale:
+        // delivery into the parent JSONL only happens once the lead itself
+        // goes idle, so a teammate that resumed via a new mailbox message
+        // and is actively mid-turn right now can still carry a
+        // `is_idle()==true` status. The teammate's OWN transcript tail is
+        // the fresher signal and must win — not get forcibly overwritten.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-amy-fixer-782b353b34c66890.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"content\":\"new task\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}],\"stop_reason\":\"tool_use\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let teammates = HashMap::from([("my-fixer".to_string(), idle_status())]);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].state, SessionState::Working);
     }
 
     #[test]
@@ -1100,6 +1534,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &teammates,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(agents.is_empty());
@@ -1127,6 +1562,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &teammates,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(agents.is_empty());
@@ -1159,6 +1595,7 @@ mod tests {
             &HashSet::new(),
             &teammates,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].task, "Second spawn");
@@ -1186,6 +1623,7 @@ mod tests {
             &HashSet::new(),
             &teammates,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("my-fixer"));
@@ -1211,6 +1649,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].task, "Sync agent");
@@ -1221,6 +1660,7 @@ mod tests {
             dir.path(),
             &HashSet::new(),
             &completed,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -1241,6 +1681,7 @@ mod tests {
             dir.path(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -1269,6 +1710,7 @@ mod tests {
             &HashSet::new(),
             &teammates,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(agents.is_empty());
     }
@@ -1296,6 +1738,7 @@ mod tests {
             dir.path(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -1334,6 +1777,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &workflow_names,
+            &HashMap::new(),
         );
         assert_eq!(agents.len(), 1);
         let run = &agents[0];
@@ -1348,6 +1792,7 @@ mod tests {
             &subagents_dir,
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -1511,6 +1956,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(agents.is_empty());
     }
@@ -1518,7 +1964,7 @@ mod tests {
     #[test]
     fn workflow_run_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(scan_workflow_runs(dir.path(), &HashMap::new()).is_empty());
+        assert!(scan_workflow_runs(dir.path(), &HashMap::new(), &HashMap::new()).is_empty());
     }
 
     // ── read_subagent_task prefix stripping ─────────────────────

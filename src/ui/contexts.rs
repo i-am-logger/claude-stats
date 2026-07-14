@@ -1,4 +1,4 @@
-use crate::data::sessions::{SessionData, SessionState, SubagentData};
+use crate::data::sessions::{PhaseProgress, SessionData, SessionState, SubagentData};
 use crate::ui::common::{indented, padded, percent_color, render_bar, Section, DIM, SPINNER};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -51,6 +51,24 @@ fn format_roster_count(agents: &[SubagentData]) -> String {
         ));
     }
     parts.join(" · ")
+}
+
+/// The phase a workflow run is "on" right now, for a compact single-line
+/// indicator: the first not-fully-done phase in declaration order, or the
+/// last phase if every phase is done. Returns `(1-based index, total phases,
+/// title)`. `None` for runs with no declared phases.
+fn current_phase(phases: &[PhaseProgress]) -> Option<(usize, usize, &str)> {
+    let total = phases.len();
+    // Not-fully-done: either no agent dispatched into it yet (`total == 0`,
+    // vacuously "done < total" would be false and wrongly skip it) or some
+    // dispatched agent hasn't finished.
+    let position = phases
+        .iter()
+        .position(|p| p.total == 0 || p.done < p.total)
+        .unwrap_or_else(|| total.saturating_sub(1));
+    phases
+        .get(position)
+        .map(|p| (position + 1, total, p.title.as_str()))
 }
 
 /// Compact two-unit runtime: "42s", "12m 42s", "1h 4m", "2d 1h".
@@ -325,6 +343,12 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
         if let Some((done, total)) = agent.progress {
             // Aggregated workflow run — mirrors Claude Code's roster entry.
             let (_, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
+            if let Some((index, phase_total, title)) = current_phase(&agent.phases) {
+                spans.push(Span::styled(
+                    format!("Phase {index}/{phase_total}: {title} "),
+                    Style::default().fg(DIM),
+                ));
+            }
             spans.push(Span::styled(
                 format!("{done}/{total} agents done"),
                 Style::default().fg(a_color),
@@ -385,6 +409,7 @@ mod tests {
                     last_write_age_secs: 0,
                     state: SessionState::Working,
                     progress: None,
+                    phases: Vec::new(),
                 })
                 .collect(),
             compactions: 0,
@@ -525,6 +550,15 @@ mod tests {
             last_write_age_secs: 0,
             state: SessionState::Working,
             progress,
+            phases: Vec::new(),
+        }
+    }
+
+    fn phase(title: &str, done: u32, total: u32) -> PhaseProgress {
+        PhaseProgress {
+            title: title.into(),
+            done,
+            total,
         }
     }
 
@@ -699,6 +733,7 @@ mod tests {
             last_write_age_secs: 0,
             state: SessionState::Working,
             progress: None,
+            phases: Vec::new(),
         }];
         let text = render_to_text(&[session], 100, 12);
         assert!(text.contains("1 agent"));
@@ -717,10 +752,50 @@ mod tests {
             last_write_age_secs: 0,
             state: SessionState::Working,
             progress: Some((1, 2)),
+            phases: Vec::new(),
         }];
         let text = render_to_text(&[session], 100, 12);
         assert!(text.contains("1 workflow"));
         assert!(text.contains("└ my-flow 1/2 agents done · 41m 58s · ↓305.8k"));
+    }
+
+    #[test]
+    fn render_workflow_row_with_phase_indicator() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: String::new(),
+            name: Some("my-flow".into()),
+            model: ModelShort::Unknown,
+            context_tokens: 305_800,
+            runtime_secs: Some(2518),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: Some((1, 2)),
+            phases: vec![
+                phase("Unified design", 1, 1),
+                phase("Adversarial review", 0, 1),
+            ],
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("Phase 2/2: Adversarial review 1/2 agents done"));
+    }
+
+    #[test]
+    fn render_workflow_row_phase_not_yet_started_shows_first_phase() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: String::new(),
+            name: Some("my-flow".into()),
+            model: ModelShort::Unknown,
+            context_tokens: 0,
+            runtime_secs: Some(5),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: Some((0, 0)),
+            phases: vec![phase("Find", 0, 0), phase("Verify", 0, 0)],
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("Phase 1/2: Find 0/0 agents done"));
     }
 
     #[test]
@@ -735,6 +810,7 @@ mod tests {
             last_write_age_secs: AGENT_STALE_DISPLAY_SECS + 1,
             state: SessionState::Working,
             progress: None,
+            phases: Vec::new(),
         }];
         let text = render_to_text(&[session], 100, 12);
         assert!(text.contains("sonnet stale — Quiet work"));
@@ -774,6 +850,7 @@ mod tests {
             last_write_age_secs: 0,
             state: SessionState::Working,
             progress: None,
+            phases: Vec::new(),
         }];
         let text = render_to_text(&[session], 100, 12);
         assert!(text.contains("? working — Just started · 5s"));

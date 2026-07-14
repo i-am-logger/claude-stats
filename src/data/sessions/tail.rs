@@ -114,6 +114,29 @@ fn terminated_teammate_name(content: &str) -> Option<String> {
     msg.contains("has shut down").then(|| name.to_string())
 }
 
+/// Split `content` into each individual `<teammate-message>...</teammate-message>`
+/// block it contains. The lead's `InboxPoller` only delivers mail while idle,
+/// so several different teammates' deliveries (each with their own
+/// `teammate_id` and embedded JSON payload) can end up batched into one
+/// relayed entry — every extraction helper above only ever looks at the
+/// *first* occurrence within whatever string it's given, so each block must
+/// be parsed in isolation rather than the whole message at once.
+fn teammate_message_blocks(content: &str) -> Vec<&str> {
+    const TAG_END: &str = "</teammate-message>";
+    let mut blocks = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("<teammate-message") {
+        let tail = &rest[start..];
+        let Some(end) = tail.find(TAG_END) else {
+            break;
+        };
+        let end = end + TAG_END.len();
+        blocks.push(&tail[..end]);
+        rest = &tail[end..];
+    }
+    blocks
+}
+
 /// Tracks all subagents observed in a session JSONL.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AgentTracker {
@@ -127,6 +150,10 @@ pub(crate) struct AgentTracker {
     /// Workflow run human names keyed by `runId`, captured from the launch
     /// event — available before the run's script/snapshot are.
     workflow_names: HashMap<String, String>,
+    /// Workflow run `taskId` keyed by `runId`, captured from the same launch
+    /// event — locates the run's live progress file under
+    /// `/tmp/claude-<uid>/<proj>/<sessionId>/tasks/<taskId>.output`.
+    workflow_task_ids: HashMap<String, String>,
 }
 
 impl AgentTracker {
@@ -271,6 +298,11 @@ impl AgentTracker {
                 .entry(run_id.clone())
                 .or_insert_with(|| name.clone());
         }
+        for (run_id, task_id) in &other.workflow_task_ids {
+            self.workflow_task_ids
+                .entry(run_id.clone())
+                .or_insert_with(|| task_id.clone());
+        }
     }
 
     /// Named teammates observed so far, keyed by name.
@@ -281,6 +313,11 @@ impl AgentTracker {
     /// Workflow run names observed via launch events, keyed by `runId`.
     pub fn workflow_names(&self) -> &HashMap<String, String> {
         &self.workflow_names
+    }
+
+    /// Workflow run `taskId`s observed via launch events, keyed by `runId`.
+    pub fn workflow_task_ids(&self) -> &HashMap<String, String> {
+        &self.workflow_task_ids
     }
 
     /// Tool-use ids that already received a `tool_result` — used to detect
@@ -320,28 +357,36 @@ impl AgentTracker {
         self.workflow_names
             .entry(run_id.to_string())
             .or_insert_with(|| name.to_string());
+        if let Some(task_id) = tool_use_result
+            .get("taskId")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.workflow_task_ids
+                .entry(run_id.to_string())
+                .or_insert_with(|| task_id.to_string());
+        }
     }
 
     /// Record teammate lifecycle frames carried in a teammate message. The
     /// exact JSON markers avoid false positives from reports that merely
     /// mention them in prose.
     fn note_teammate_idle(&mut self, content: &str, val: &serde_json::Value) {
-        if !content.contains("<teammate-message") {
-            return;
-        }
-        if content.contains("\"type\":\"idle_notification\"") {
-            if let Some(name) = teammate_name_from_message(content) {
-                // Prefer the notification's embedded timestamp — delivery to
-                // the parent JSONL can lag minutes behind the actual idle.
-                let ts = embedded_timestamp(content).or_else(|| entry_timestamp(val));
-                let status = self.teammates.entry(name.to_string()).or_default();
-                status.last_idle_at = status.last_idle_at.max(ts);
+        for block in teammate_message_blocks(content) {
+            if block.contains("\"type\":\"idle_notification\"") {
+                if let Some(name) = teammate_name_from_message(block) {
+                    // Prefer the notification's embedded timestamp — delivery
+                    // to the parent JSONL can lag minutes behind the actual
+                    // idle.
+                    let ts = embedded_timestamp(block).or_else(|| entry_timestamp(val));
+                    let status = self.teammates.entry(name.to_string()).or_default();
+                    status.last_idle_at = status.last_idle_at.max(ts);
+                }
             }
-        }
-        // "X has shut down" — the only explicit termination frame.
-        if content.contains("\"type\":\"teammate_terminated\"") {
-            if let Some(name) = terminated_teammate_name(content) {
-                self.teammates.entry(name).or_default().terminated = true;
+            // "X has shut down" — the only explicit termination frame.
+            if block.contains("\"type\":\"teammate_terminated\"") {
+                if let Some(name) = terminated_teammate_name(block) {
+                    self.teammates.entry(name).or_default().terminated = true;
+                }
             }
         }
     }
@@ -410,6 +455,10 @@ struct ScanState {
     tracker: AgentTracker,
     model: String,
     git_branch: String,
+    /// `cwd` from the first `user`-type line seen in this scan range; empty
+    /// if none. A session's cwd doesn't change mid-session (unlike
+    /// `git_branch`), so the first one found is kept.
+    cwd: String,
 }
 
 impl ScanState {
@@ -421,6 +470,7 @@ impl ScanState {
             tracker: AgentTracker::new(),
             model: String::new(),
             git_branch: String::new(),
+            cwd: String::new(),
         }
     }
 
@@ -470,6 +520,17 @@ impl ScanState {
             }
         }
 
+        // First user line's cwd — mirrors the extraction in scan_session_file
+        // so an incremental scan can also recover it if the initial full scan
+        // ran before any user line existed yet (a freshly-created session).
+        if self.cwd.is_empty() && val.get("type").and_then(|t| t.as_str()) == Some("user") {
+            if let Some(cwd) = val.get("cwd").and_then(serde_json::Value::as_str) {
+                if !cwd.is_empty() {
+                    self.cwd = cwd.to_string();
+                }
+            }
+        }
+
         self.tracker.process(val);
     }
 
@@ -481,6 +542,7 @@ impl ScanState {
             tracker: self.tracker,
             model: self.model,
             git_branch: self.git_branch,
+            cwd: self.cwd,
         }
     }
 }
@@ -541,6 +603,10 @@ pub struct ScanResult {
     pub model: String,
     /// Latest `gitBranch` seen in the scanned range; empty if none.
     pub git_branch: String,
+    /// `cwd` from the first `user`-type line in the scanned range; empty if
+    /// none was seen (e.g. the session's first user line was already scanned
+    /// in an earlier pass).
+    pub cwd: String,
 }
 
 /// Scan a session file from `offset` to EOF. Tracks token usage, compaction
@@ -1145,6 +1211,33 @@ mod tests {
     }
 
     #[test]
+    fn tracker_batched_idle_notifications_update_every_teammate() {
+        // The lead's InboxPoller only delivers mail while idle, so several
+        // teammates going idle while the lead is busy can land as one
+        // relayed entry with multiple concatenated <teammate-message> blocks.
+        let mut tracker = AgentTracker::new();
+        tracker.process(&teammate_spawn_entry("angle1", "2026-07-13T11:19:00.000Z"));
+        tracker.process(&teammate_spawn_entry("angle2", "2026-07-13T11:19:00.000Z"));
+        tracker.process(&teammate_spawn_entry("angle3", "2026-07-13T11:19:00.000Z"));
+
+        let batched_content = format!(
+            "{}{}{}",
+            "<teammate-message teammate_id=\"angle1@t\">{\"type\":\"idle_notification\",\"timestamp\":\"2026-07-13T11:20:00.000Z\"}</teammate-message>",
+            "<teammate-message teammate_id=\"angle2@t\">{\"type\":\"idle_notification\",\"timestamp\":\"2026-07-13T11:20:01.000Z\"}</teammate-message>",
+            "<teammate-message teammate_id=\"angle3@t\">{\"type\":\"idle_notification\",\"timestamp\":\"2026-07-13T11:20:02.000Z\"}</teammate-message>",
+        );
+        tracker.process(&serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-07-13T11:28:00.000Z",
+            "message": {"content": batched_content}
+        }));
+
+        assert!(tracker.teammates()["angle1"].is_idle());
+        assert!(tracker.teammates()["angle2"].is_idle());
+        assert!(tracker.teammates()["angle3"].is_idle());
+    }
+
+    #[test]
     fn tracker_teammate_respawn_after_idle_is_active() {
         let mut tracker = AgentTracker::new();
         tracker.process(&teammate_spawn_entry(
@@ -1240,6 +1333,10 @@ mod tests {
             tracker.workflow_names().get("wf_8001925fe44a"),
             Some(&"review-changes".to_string())
         );
+        assert_eq!(
+            tracker.workflow_task_ids().get("wf_8001925fe44a"),
+            Some(&"w1a2b3c4".to_string())
+        );
     }
 
     #[test]
@@ -1307,6 +1404,39 @@ mod tests {
         assert_eq!(
             a.workflow_names().get("wf_shared"),
             Some(&"first-seen".to_string())
+        );
+    }
+
+    #[test]
+    fn tracker_workflow_launch_merge_keeps_first_seen_task_id() {
+        let mut a = AgentTracker::new();
+        a.process(&serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "status": "async_launched",
+                "taskType": "local_workflow",
+                "taskId": "first-task",
+                "runId": "wf_shared",
+                "workflowName": "shared"
+            },
+            "message": {"content": []}
+        }));
+        let mut b = AgentTracker::new();
+        b.process(&serde_json::json!({
+            "type": "user",
+            "toolUseResult": {
+                "status": "async_launched",
+                "taskType": "local_workflow",
+                "taskId": "second-task",
+                "runId": "wf_shared",
+                "workflowName": "shared"
+            },
+            "message": {"content": []}
+        }));
+        a.merge(&b);
+        assert_eq!(
+            a.workflow_task_ids().get("wf_shared"),
+            Some(&"first-task".to_string())
         );
     }
 
@@ -1567,6 +1697,33 @@ mod tests {
         assert!(result.last_lines.back().unwrap().contains("\"n\":7"));
         // Oldest retained should be n:3
         assert!(result.last_lines.front().unwrap().contains("\"n\":3"));
+    }
+
+    #[test]
+    fn scan_from_offset_extracts_cwd_from_first_user_line() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"type":"system","subtype":"init"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","cwd":"/home/user/proj","message":{{"content":"hi"}}}}"#
+        )
+        .unwrap();
+        f.as_file().sync_all().unwrap();
+
+        let result = scan_from_offset(f.as_file(), 0);
+        assert_eq!(result.cwd, "/home/user/proj");
+    }
+
+    #[test]
+    fn scan_from_offset_empty_cwd_when_no_user_line() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"type":"system","subtype":"init"}}"#).unwrap();
+        f.as_file().sync_all().unwrap();
+
+        let result = scan_from_offset(f.as_file(), 0);
+        assert_eq!(result.cwd, "");
     }
 
     // ── property tests ────────────────────────────────────────────
