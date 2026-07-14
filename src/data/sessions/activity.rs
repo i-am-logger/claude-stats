@@ -194,7 +194,7 @@ fn extract_tool_names(val: &Value) -> Activity {
     // Scoped to the common case (TaskUpdate is the only tool call in the
     // turn, its usual "just a status bookkeeping call" shape); a TaskUpdate
     // mixed with other tool calls in the same turn falls through to the
-    // generic per-tool rendering below like everything else.
+    // TaskCreate/generic handling below like everything else.
     let tool_uses: Vec<&Value> = arr
         .iter()
         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
@@ -209,58 +209,31 @@ fn extract_tool_names(val: &Value) -> Activity {
         }
     }
 
-    let tools: Vec<String> = arr.iter().filter_map(format_tool_use).collect();
-    if tools.is_empty() {
-        Activity::Text("working".to_string())
-    } else {
-        Activity::Text(tools.join(", "))
-    }
+    // Claude Code's own status header only ever shows `activeForm`/`subject`
+    // text or a decorative random verb — never a reconstructed tool call
+    // (confirmed via binary forensics: the header's priority chain is
+    // `overrideMessage ?? activeForm ?? subject ?? randomVerb`, with no tool
+    // name/input anywhere in it). A `TaskCreate` call's activeForm/subject is
+    // already sitting right there in the tool_use block — no extra file read
+    // needed, unlike TaskUpdate (see above). Any other tool (Bash, Read,
+    // Task, ...) has no equivalent in Claude Code's own header, so it falls
+    // back to the same generic state word a `randomVerb` would occupy,
+    // rather than reconstructing what the tool call actually did.
+    tool_uses
+        .iter()
+        .find(|b| b.get("name").and_then(|n| n.as_str()) == Some("TaskCreate"))
+        .map_or_else(
+            || Activity::Text("working".to_string()),
+            |block| Activity::Text(task_create_text(block)),
+        )
 }
 
-fn format_tool_use(block: &Value) -> Option<String> {
-    if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-        return None;
-    }
-
-    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-    Some(match name {
-        "Bash" => {
-            let cmd = block
-                .pointer("/input/command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let short = cmd.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
-            if short.is_empty() {
-                "Bash".to_string()
-            } else {
-                format!("Bash({})", truncate_str(&short, 30))
-            }
-        }
-        "Read" | "Edit" | "Write" | "Glob" | "Grep" => {
-            let path = block
-                .pointer("/input/file_path")
-                .or_else(|| block.pointer("/input/pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let short = path.rsplit('/').next().unwrap_or(path);
-            if short.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}({})", name, truncate_str(short, 25))
-            }
-        }
-        "Task" => "Task(subagent)".to_string(),
-        // The activeForm/subject text is already sitting in the tool_use
-        // block — no extra file read needed, unlike TaskUpdate (whose input
-        // is only {taskId, status}, so its human-readable text lives only in
-        // the shared TaskList sidecar file — see tasks.rs).
-        "TaskCreate" => block
-            .pointer("/input/activeForm")
-            .or_else(|| block.pointer("/input/subject"))
-            .and_then(|v| v.as_str())
-            .map_or_else(|| "TaskCreate".to_string(), |s| truncate_str(s, 60)),
-        _ => name.to_string(),
-    })
+fn task_create_text(block: &Value) -> String {
+    block
+        .pointer("/input/activeForm")
+        .or_else(|| block.pointer("/input/subject"))
+        .and_then(|v| v.as_str())
+        .map_or_else(|| "TaskCreate".to_string(), |s| truncate_str(s, 60))
 }
 
 #[cfg(test)]
@@ -533,7 +506,7 @@ mod tests {
             "type": "assistant",
             "message": {
                 "content": [
-                    {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}}
+                    {"type": "tool_use", "name": "TaskCreate", "input": {"activeForm": "Testing things"}}
                 ]
             }
         });
@@ -544,7 +517,7 @@ mod tests {
         let parsed = vec![Some(tool_val), Some(progress_val)];
         assert_eq!(
             extract_activity_from_parsed(&parsed),
-            Activity::Text("Bash(cargo test)".to_string())
+            Activity::Text("Testing things".to_string())
         );
     }
 
@@ -567,14 +540,14 @@ mod tests {
             "type": "assistant",
             "message": {
                 "content": [
-                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/src/main.rs"}}
+                    {"type": "tool_use", "name": "TaskCreate", "input": {"activeForm": "Reading main.rs"}}
                 ]
             }
         });
         let parsed = vec![Some(tool), Some(meta.clone()), Some(meta)];
         assert_eq!(
             extract_activity_from_parsed(&parsed),
-            Activity::Text("Read(main.rs)".to_string())
+            Activity::Text("Reading main.rs".to_string())
         );
     }
 
@@ -605,64 +578,32 @@ mod tests {
         );
     }
 
-    // ── format_tool_use ────────────────────────────────────────────
+    // ── task_create_text ────────────────────────────────────────────
 
     #[test]
-    fn format_tool_use_bash() {
-        let block = json!({"type": "tool_use", "name": "Bash", "input": {"command": "git status"}});
-        assert_eq!(format_tool_use(&block).unwrap(), "Bash(git status)");
-    }
-
-    #[test]
-    fn format_tool_use_read() {
-        let block =
-            json!({"type": "tool_use", "name": "Read", "input": {"file_path": "/a/b/c.rs"}});
-        assert_eq!(format_tool_use(&block).unwrap(), "Read(c.rs)");
-    }
-
-    #[test]
-    fn format_tool_use_glob() {
-        let block = json!({"type": "tool_use", "name": "Glob", "input": {"pattern": "**/*.rs"}});
-        // rsplit('/') on "**/*.rs" yields "*.rs" (last path segment)
-        assert_eq!(format_tool_use(&block).unwrap(), "Glob(*.rs)");
-    }
-
-    #[test]
-    fn format_tool_use_task() {
-        let block = json!({"type": "tool_use", "name": "Task", "input": {}});
-        assert_eq!(format_tool_use(&block).unwrap(), "Task(subagent)");
-    }
-
-    #[test]
-    fn format_tool_use_unknown() {
-        let block = json!({"type": "tool_use", "name": "CustomTool", "input": {}});
-        assert_eq!(format_tool_use(&block).unwrap(), "CustomTool");
-    }
-
-    #[test]
-    fn format_tool_use_task_create_shows_active_form() {
+    fn task_create_text_shows_active_form() {
         let block = json!({
             "type": "tool_use",
             "name": "TaskCreate",
             "input": {"subject": "Fix the bug", "activeForm": "Fixing the bug"}
         });
-        assert_eq!(format_tool_use(&block).unwrap(), "Fixing the bug");
+        assert_eq!(task_create_text(&block), "Fixing the bug");
     }
 
     #[test]
-    fn format_tool_use_task_create_falls_back_to_subject() {
+    fn task_create_text_falls_back_to_subject() {
         let block = json!({
             "type": "tool_use",
             "name": "TaskCreate",
             "input": {"subject": "Fix the bug"}
         });
-        assert_eq!(format_tool_use(&block).unwrap(), "Fix the bug");
+        assert_eq!(task_create_text(&block), "Fix the bug");
     }
 
     #[test]
-    fn format_tool_use_task_create_no_fields() {
+    fn task_create_text_no_fields() {
         let block = json!({"type": "tool_use", "name": "TaskCreate", "input": {}});
-        assert_eq!(format_tool_use(&block).unwrap(), "TaskCreate");
+        assert_eq!(task_create_text(&block), "TaskCreate");
     }
 
     #[test]
@@ -684,11 +625,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_tool_names_task_update_mixed_with_other_tool_renders_as_text() {
-        // Not the lone-call shape TaskUpdate usually has — falls through to
-        // the generic per-tool rendering (bare "TaskUpdate" alongside it)
-        // rather than trying to resolve a lookup for just one of several
-        // tool calls in the same turn.
+    fn extract_tool_names_task_update_mixed_with_other_tool_falls_back_to_working() {
+        // Not the lone-call shape TaskUpdate usually has — falls through past
+        // the by-id lookup, and with no TaskCreate call present either,
+        // lands on the generic state word rather than trying to resolve a
+        // lookup for just one of several tool calls in the same turn.
         let val = json!({
             "type": "assistant",
             "message": {
@@ -700,12 +641,29 @@ mod tests {
         });
         assert_eq!(
             extract_tool_names(&val),
-            Activity::Text("Bash(ls), TaskUpdate".to_string())
+            Activity::Text("working".to_string())
         );
     }
 
     #[test]
-    fn extract_tool_names_task_update_missing_task_id_falls_back_to_text() {
+    fn extract_tool_names_finds_task_create_mixed_with_other_tools() {
+        let val = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+                    {"type": "tool_use", "name": "TaskCreate", "input": {"activeForm": "Adding a test"}}
+                ]
+            }
+        });
+        assert_eq!(
+            extract_tool_names(&val),
+            Activity::Text("Adding a test".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_task_update_missing_task_id_falls_back_to_working() {
         let val = json!({
             "type": "assistant",
             "message": {
@@ -716,30 +674,12 @@ mod tests {
         });
         assert_eq!(
             extract_tool_names(&val),
-            Activity::Text("TaskUpdate".to_string())
+            Activity::Text("working".to_string())
         );
     }
 
     #[test]
-    fn format_tool_use_non_tool() {
-        let block = json!({"type": "text", "text": "hello"});
-        assert!(format_tool_use(&block).is_none());
-    }
-
-    #[test]
-    fn format_tool_use_bash_empty_command() {
-        let block = json!({"type": "tool_use", "name": "Bash", "input": {}});
-        assert_eq!(format_tool_use(&block).unwrap(), "Bash");
-    }
-
-    #[test]
-    fn format_tool_use_read_empty_path() {
-        let block = json!({"type": "tool_use", "name": "Read", "input": {}});
-        assert_eq!(format_tool_use(&block).unwrap(), "Read");
-    }
-
-    #[test]
-    fn format_tool_use_multiple_tools() {
+    fn extract_tool_names_no_task_create_falls_back_to_working() {
         let val = json!({
             "type": "assistant",
             "message": {
@@ -751,7 +691,7 @@ mod tests {
         });
         assert_eq!(
             extract_tool_names(&val),
-            Activity::Text("Bash(ls), Read(bar.rs)".to_string())
+            Activity::Text("working".to_string())
         );
     }
 

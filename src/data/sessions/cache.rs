@@ -718,7 +718,7 @@ mod tests {
         let session = cache.parse_session(f.path(), 2).unwrap();
 
         assert_eq!(session.state, SessionState::Working);
-        assert_eq!(session.activity, "Bash(ls)");
+        assert_eq!(session.activity, "working");
     }
 
     #[test]

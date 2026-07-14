@@ -39,9 +39,10 @@ fn read_task_file(path: &Path) -> Option<TaskFile> {
 /// The current session's `activeForm` text, if it has an in-progress task
 /// nobody else owns — the same text and priority Claude Code's own status
 /// header shows (`activeForm ?? subject`), taking precedence there over a
-/// decorative random verb; here it takes precedence over the last-tool-call
-/// reconstruction in `activity::extract_activity_from_parsed`. `tasks_root`
-/// is injected (production passes `~/.claude/tasks`) for testability.
+/// decorative random verb; here it takes precedence over the generic state
+/// word `activity::extract_activity_from_parsed` falls back to when no
+/// `TaskCreate` call is in view either. `tasks_root` is injected (production
+/// passes `~/.claude/tasks`) for testability.
 ///
 /// Task ids are unique, monotonically-issued strings (`.highwatermark`)
 /// formatted as plain integers — sorting numerically picks the
