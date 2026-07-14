@@ -117,11 +117,22 @@ pub fn detect_state_from_tail(file: &fs::File, file_len: u64) -> SessionState {
 fn extract_activity_from_parsed(parsed: &[Option<Value>]) -> String {
     for val in parsed.iter().rev().flatten() {
         match classify_line(val) {
-            LineKind::Progress => {
-                if let Some(activity) = extract_progress_activity(val) {
-                    return activity;
-                }
-                // bash_progress or unrecognized — continue scanning
+            // `progress`-type entries (hook_progress/agent_progress/
+            // waiting_for_task/bash_progress) are dead in Claude Code
+            // 2.1.198+ — confirmed empirically, zero live hits across real
+            // transcripts (see docs/claude-code-internals.md §2.4). Still
+            // classified as `LineKind::Progress` for state detection
+            // (state_from_json), but there's no activity text left to
+            // extract here — skip and keep scanning for the last real
+            // assistant tool_use.
+            // A trailing compact_boundary is a real, alive signal (unlike
+            // the dead progress subtypes above) — state_from_json already
+            // treats it as Working; say what's actually happening instead
+            // of falling through to the generic "working".
+            LineKind::System
+                if val.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary") =>
+            {
+                return "compacting".to_string();
             }
             LineKind::Assistant => {
                 return extract_tool_names(val);
@@ -130,41 +141,6 @@ fn extract_activity_from_parsed(parsed: &[Option<Value>]) -> String {
         }
     }
     "working".to_string()
-}
-
-fn extract_progress_activity(val: &Value) -> Option<String> {
-    let data_type = val.pointer("/data/type").and_then(|t| t.as_str());
-    match data_type {
-        Some("bash_progress") => {
-            // bash_progress doesn't carry the command; let scan continue
-            // to find the preceding assistant tool_use block
-            None
-        }
-        Some("hook_progress") => {
-            let hook_name = val
-                .pointer("/data/hookName")
-                .and_then(|n| n.as_str())
-                .unwrap_or("hook");
-            Some(format!("Hook({})", truncate_str(hook_name, 30)))
-        }
-        Some("agent_progress") => {
-            let prompt = val
-                .pointer("/data/prompt")
-                .and_then(|p| p.as_str())
-                .unwrap_or("");
-            let first_line = prompt.lines().next().unwrap_or("").trim();
-            if first_line.is_empty() {
-                Some("subagent working".to_string())
-            } else {
-                Some(format!("Agent({})", truncate_str(first_line, 40)))
-            }
-        }
-        Some("waiting_for_task") => Some("waiting for task".to_string()),
-        _ => {
-            // Other progress types (tool output streaming, etc.) — working
-            Some("working".to_string())
-        }
-    }
 }
 
 fn extract_tool_names(val: &Value) -> String {
@@ -217,6 +193,15 @@ fn format_tool_use(block: &Value) -> Option<String> {
             }
         }
         "Task" => "Task(subagent)".to_string(),
+        // The activeForm/subject text is already sitting in the tool_use
+        // block — no extra file read needed, unlike TaskUpdate (whose input
+        // is only {taskId, status}, so its human-readable text lives only in
+        // the shared TaskList sidecar file — see tasks.rs).
+        "TaskCreate" => block
+            .pointer("/input/activeForm")
+            .or_else(|| block.pointer("/input/subject"))
+            .and_then(|v| v.as_str())
+            .map_or_else(|| "TaskCreate".to_string(), |s| truncate_str(s, 60)),
         _ => name.to_string(),
     })
 }
@@ -444,55 +429,10 @@ mod tests {
     // ── extract_activity ───────────────────────────────────────────
 
     #[test]
-    fn activity_hook_progress() {
-        let val = json!({
-            "type": "progress",
-            "data": {"type": "hook_progress", "hookName": "pre-commit"}
-        });
-        assert_eq!(
-            extract_activity_from_parsed(&[Some(val)]),
-            "Hook(pre-commit)"
-        );
-    }
-
-    #[test]
-    fn activity_agent_progress_with_prompt() {
-        let val = json!({
-            "type": "progress",
-            "data": {"type": "agent_progress", "prompt": "Search for tests\nin the repo"}
-        });
-        assert_eq!(
-            extract_activity_from_parsed(&[Some(val)]),
-            "Agent(Search for tests)"
-        );
-    }
-
-    #[test]
-    fn activity_agent_progress_no_prompt() {
-        let val = json!({
-            "type": "progress",
-            "data": {"type": "agent_progress"}
-        });
-        assert_eq!(
-            extract_activity_from_parsed(&[Some(val)]),
-            "subagent working"
-        );
-    }
-
-    #[test]
-    fn activity_waiting_for_task() {
-        let val = json!({
-            "type": "progress",
-            "data": {"type": "waiting_for_task"}
-        });
-        assert_eq!(
-            extract_activity_from_parsed(&[Some(val)]),
-            "waiting for task"
-        );
-    }
-
-    #[test]
-    fn activity_bash_progress_falls_through_to_tool_use() {
+    fn activity_progress_line_skipped_falls_through_to_tool_use() {
+        // `progress`-type entries carry no usable activity text (dead since
+        // 2.1.198+) — the scan must skip over one and keep looking for the
+        // preceding real assistant tool_use.
         let tool_val = json!({
             "type": "assistant",
             "message": {
@@ -505,13 +445,12 @@ mod tests {
             "type": "progress",
             "data": {"type": "bash_progress", "output": "running..."}
         });
-        // tool_use comes first, then bash_progress
         let parsed = vec![Some(tool_val), Some(progress_val)];
         assert_eq!(extract_activity_from_parsed(&parsed), "Bash(cargo test)");
     }
 
     #[test]
-    fn activity_bash_progress_alone_falls_back_to_working() {
+    fn activity_progress_line_alone_falls_back_to_working() {
         let val = json!({
             "type": "progress",
             "data": {"type": "bash_progress", "output": "stuff"}
@@ -538,6 +477,18 @@ mod tests {
     fn activity_fallback_working() {
         let parsed: Vec<Option<Value>> = vec![None, None];
         assert_eq!(extract_activity_from_parsed(&parsed), "working");
+    }
+
+    #[test]
+    fn activity_compact_boundary_shows_compacting() {
+        let val = json!({"type": "system", "subtype": "compact_boundary"});
+        assert_eq!(extract_activity_from_parsed(&[Some(val)]), "compacting");
+    }
+
+    #[test]
+    fn activity_other_system_subtype_falls_back_to_working() {
+        let val = json!({"type": "system", "subtype": "turn_duration"});
+        assert_eq!(extract_activity_from_parsed(&[Some(val)]), "working");
     }
 
     // ── format_tool_use ────────────────────────────────────────────
@@ -572,6 +523,32 @@ mod tests {
     fn format_tool_use_unknown() {
         let block = json!({"type": "tool_use", "name": "CustomTool", "input": {}});
         assert_eq!(format_tool_use(&block).unwrap(), "CustomTool");
+    }
+
+    #[test]
+    fn format_tool_use_task_create_shows_active_form() {
+        let block = json!({
+            "type": "tool_use",
+            "name": "TaskCreate",
+            "input": {"subject": "Fix the bug", "activeForm": "Fixing the bug"}
+        });
+        assert_eq!(format_tool_use(&block).unwrap(), "Fixing the bug");
+    }
+
+    #[test]
+    fn format_tool_use_task_create_falls_back_to_subject() {
+        let block = json!({
+            "type": "tool_use",
+            "name": "TaskCreate",
+            "input": {"subject": "Fix the bug"}
+        });
+        assert_eq!(format_tool_use(&block).unwrap(), "Fix the bug");
+    }
+
+    #[test]
+    fn format_tool_use_task_create_no_fields() {
+        let block = json!({"type": "tool_use", "name": "TaskCreate", "input": {}});
+        assert_eq!(format_tool_use(&block).unwrap(), "TaskCreate");
     }
 
     #[test]

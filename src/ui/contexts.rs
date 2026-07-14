@@ -56,8 +56,8 @@ fn format_roster_count(agents: &[SubagentData]) -> String {
 /// The phase a workflow run is "on" right now, for a compact single-line
 /// indicator: the first not-fully-done phase in declaration order, or the
 /// last phase if every phase is done. Returns `(1-based index, total phases,
-/// title)`. `None` for runs with no declared phases.
-fn current_phase(phases: &[PhaseProgress]) -> Option<(usize, usize, &str)> {
+/// phase)`. `None` for runs with no declared phases.
+fn current_phase(phases: &[PhaseProgress]) -> Option<(usize, usize, &PhaseProgress)> {
     let total = phases.len();
     // Not-fully-done: either no agent dispatched into it yet (`total == 0`,
     // vacuously "done < total" would be false and wrongly skip it) or some
@@ -66,9 +66,7 @@ fn current_phase(phases: &[PhaseProgress]) -> Option<(usize, usize, &str)> {
         .iter()
         .position(|p| p.total == 0 || p.done < p.total)
         .unwrap_or_else(|| total.saturating_sub(1));
-    phases
-        .get(position)
-        .map(|p| (position + 1, total, p.title.as_str()))
+    phases.get(position).map(|p| (position + 1, total, p))
 }
 
 /// Compact two-unit runtime: "42s", "12m 42s", "1h 4m", "2d 1h".
@@ -349,9 +347,10 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
         if let Some((done, total)) = agent.progress {
             // Aggregated workflow run — mirrors Claude Code's roster entry.
             let (_, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
-            if let Some((index, phase_total, title)) = current_phase(&agent.phases) {
+            let current = current_phase(&agent.phases);
+            if let Some((index, phase_total, phase)) = current {
                 spans.push(Span::styled(
-                    format!("Phase {index}/{phase_total}: {title} "),
+                    format!("Phase {index}/{phase_total}: {} ", phase.title),
                     Style::default().fg(DIM),
                 ));
             }
@@ -359,6 +358,15 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
                 format!("{done}/{total} agents done"),
                 Style::default().fg(a_color),
             ));
+            if !agent.task.is_empty() {
+                spans.push(Span::styled(
+                    format!(" — {}", agent.task),
+                    Style::default().fg(Color::Red),
+                ));
+            } else if let Some(tool) = current.and_then(|(_, _, phase)| phase.current_tool.as_ref())
+            {
+                spans.push(Span::styled(format!(" — {tool}"), Style::default().fg(DIM)));
+            }
         } else {
             let (a_state, a_color) = agent_state_display(agent.state, agent.last_write_age_secs);
             spans.push(Span::styled(
@@ -566,6 +574,7 @@ mod tests {
             title: title.into(),
             done,
             total,
+            current_tool: None,
         }
     }
 
@@ -781,6 +790,47 @@ mod tests {
         let text = render_to_text(&[session], 100, 12);
         assert!(text.contains("1 workflow"));
         assert!(text.contains("└ my-flow 1/2 agents done · 41m 58s · ↓305.8k"));
+    }
+
+    #[test]
+    fn render_workflow_row_failed_state_shown() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: "failed".into(),
+            name: Some("my-flow".into()),
+            model: ModelShort::Unknown,
+            context_tokens: 1_000,
+            runtime_secs: Some(60),
+            last_write_age_secs: 0,
+            state: SessionState::Idle,
+            progress: Some((1, 2)),
+            phases: Vec::new(),
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("1/2 agents done — failed"));
+    }
+
+    #[test]
+    fn render_workflow_row_shows_current_agent_tool() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            task: String::new(),
+            name: Some("my-flow".into()),
+            model: ModelShort::Unknown,
+            context_tokens: 1_000,
+            runtime_secs: Some(60),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: Some((0, 1)),
+            phases: vec![PhaseProgress {
+                title: "Build".into(),
+                done: 0,
+                total: 1,
+                current_tool: Some("cargo test --workspace".into()),
+            }],
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("0/1 agents done — cargo test --workspace"));
     }
 
     #[test]

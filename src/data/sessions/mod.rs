@@ -60,6 +60,11 @@ pub struct PhaseProgress {
     pub title: String,
     pub done: u32,
     pub total: u32,
+    /// What the phase's currently-running agent is doing right now (its
+    /// `lastToolSummary`, falling back to `lastToolName`), from the first
+    /// not-yet-`done` `workflow_agent` entry assigned to this phase. `None`
+    /// if every agent in the phase is done, or none has reported a tool yet.
+    pub current_tool: Option<String>,
 }
 
 #[derive(Debug, Clone)]

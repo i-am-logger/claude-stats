@@ -22,16 +22,11 @@ use std::path::{Path, PathBuf};
 /// observed in practice are stale by many hours.
 pub(crate) const AGENT_STALE_SECS: u64 = 1800;
 
-/// Hide idle teammates once their transcript has been quiet this long.
-/// Claude Code evicts an idle teammate from its roster after a 30s grace
-/// (`evictAfter = now + 30_000` in its team UI); the transcript mtime is the
-/// idle clock — the idle notification's delivery to the parent JSONL can lag
-/// minutes behind. Hiding is recomputed every scan, so a teammate resumed
-/// via its mailbox writes again and reappears immediately.
-pub(crate) const TEAMMATE_IDLE_HIDE_SECS: u64 = 30;
-
-/// How long a finished workflow run ("N/N agents done") lingers on the
-/// roster before disappearing — Claude Code evicts terminal rows after 30s.
+/// How long a row that just went terminal lingers before disappearing —
+/// Claude Code evicts terminal roster rows ~30s after completion for every
+/// row kind (workflow runs, plain/sync agents, teammate shutdown/removal).
+/// Idle (but not terminated) teammates are a different case and are never
+/// evicted by this or any other timeout, matching Claude Code's own roster.
 pub(crate) const RUN_DONE_LINGER_SECS: u64 = 30;
 
 /// Scan subagent JSONL files and return data for agents that are still active.
@@ -146,10 +141,13 @@ fn collect_agents(
                 return None;
             }
             let tool_use_id = meta.tool_use_id.as_deref()?;
-            if completed_tool_ids.contains(tool_use_id) {
-                return None;
-            }
             let (data, _) = parse_subagent(&path)?;
+            if completed_tool_ids.contains(tool_use_id) {
+                // Finished — linger briefly like a workflow run, then
+                // disappear, instead of vanishing the instant its
+                // tool_result lands.
+                return (data.last_write_age_secs <= RUN_DONE_LINGER_SECS).then_some(data);
+            }
             // Crashed parents leave no completion marker — cap by staleness.
             (data.last_write_age_secs <= AGENT_STALE_SECS).then_some(data)
         })
@@ -173,11 +171,6 @@ fn parse_teammate(
     status: &TeammateStatus,
     teams_dir: Option<&Path>,
 ) -> Option<SubagentData> {
-    // An explicit "X has shut down" frame ends the roster row immediately.
-    if status.terminated {
-        return None;
-    }
-
     let (mut data, last_user_ts) = parse_subagent(path)?;
 
     // Any termination path (kill, graceful shutdown, spawn-failure rollback)
@@ -191,19 +184,21 @@ fn parse_teammate(
         .map_or(TeamMembership::Unknown, |(team, dir)| {
             team_membership(dir, &team, name)
         });
-    if matches!(membership, TeamMembership::Absent) {
-        return None;
+
+    // An explicit "X has shut down" frame or disappearing from the team file
+    // are both real termination signals — linger briefly like a finished
+    // workflow run (Claude Code evicts terminal roster rows after the same
+    // window), then disappear, instead of vanishing the instant termination
+    // is detected.
+    if status.terminated || matches!(membership, TeamMembership::Absent) {
+        return (data.last_write_age_secs <= RUN_DONE_LINGER_SECS).then_some(data);
     }
 
     if status.is_idle() && data.state == SessionState::Idle {
-        // Idle means "available", not terminated — keep the roster row while
-        // the transcript is fresh, drop it once it goes quiet. Both signals
-        // agree here (the idle_notification AND the teammate's own
-        // transcript tail, which independently reads as a finished turn) —
-        // safe to apply the tight hide window.
-        if data.last_write_age_secs > TEAMMATE_IDLE_HIDE_SECS {
-            return None;
-        }
+        // Idle means "available", not terminated. Real Claude Code never
+        // evicts idle teammates from its roster — only terminal rows linger-
+        // then-disappear — so an idle teammate whose transcript is still on
+        // disk keeps showing indefinitely, same as CC's own picker.
     } else if data.last_write_age_secs > AGENT_STALE_SECS {
         // Either genuinely active (never sent an idle notification, or the
         // transcript tail shows fresh work — see below), or a stale/absent
@@ -297,6 +292,10 @@ struct ProgressEntry {
     #[serde(rename = "phaseTitle")]
     phase_title: Option<String>,
     state: Option<String>,
+    #[serde(rename = "lastToolName")]
+    last_tool_name: Option<String>,
+    #[serde(rename = "lastToolSummary")]
+    last_tool_summary: Option<String>,
 }
 
 /// Reduce a run's raw `workflowProgress` entries to per-phase done/total
@@ -313,6 +312,7 @@ fn derive_phases(entries: &[ProgressEntry]) -> Vec<PhaseProgress> {
             title,
             done: 0,
             total: 0,
+            current_tool: None,
         })
         .collect();
     for entry in entries.iter().filter(|e| e.kind == "workflow_agent") {
@@ -323,6 +323,11 @@ fn derive_phases(entries: &[ProgressEntry]) -> Vec<PhaseProgress> {
             phase.total += 1;
             if entry.state.as_deref() == Some("done") {
                 phase.done += 1;
+            } else if phase.current_tool.is_none() {
+                phase.current_tool = entry
+                    .last_tool_summary
+                    .clone()
+                    .or_else(|| entry.last_tool_name.clone());
             }
         }
     }
@@ -341,6 +346,12 @@ struct RunSnapshot {
     total_tokens: Option<u64>,
     #[serde(rename = "workflowProgress", default)]
     workflow_progress: Vec<ProgressEntry>,
+    /// Wall-clock run duration, captured once at completion — the
+    /// authoritative "how long did this actually take", as opposed to
+    /// `now() - started_at` which keeps ticking for as long as the finished
+    /// row lingers on the roster.
+    #[serde(rename = "durationMs")]
+    duration_ms: Option<u64>,
 }
 
 /// Live progress file Claude Code polls background/workflow tasks through
@@ -487,12 +498,18 @@ fn parse_workflow_run(
         }
     }
 
-    let runtime_secs = started_at.map(|t| {
-        (chrono::Utc::now() - t)
-            .num_seconds()
-            .max(0)
-            .cast_unsigned()
-    });
+    // A terminal run's elapsed time is frozen at its own recorded duration —
+    // otherwise it keeps ticking wall-clock for the whole linger window
+    // after the run already finished, which reads as still-running.
+    let runtime_secs = match snapshot.as_ref().and_then(|s| s.duration_ms) {
+        Some(duration_ms) => Some(duration_ms / 1000),
+        None => started_at.map(|t| {
+            (chrono::Utc::now() - t)
+                .num_seconds()
+                .max(0)
+                .cast_unsigned()
+        }),
+    };
 
     let snapshot_name = snapshot.as_ref().and_then(|s| s.workflow_name.clone());
     let snapshot_tokens = snapshot.as_ref().and_then(|s| s.total_tokens);
@@ -1231,15 +1248,59 @@ mod tests {
                 PhaseProgress {
                     title: "Find".into(),
                     done: 2,
-                    total: 2
+                    total: 2,
+                    current_tool: None,
                 },
                 PhaseProgress {
                     title: "Verify".into(),
                     done: 0,
-                    total: 1
+                    total: 1,
+                    current_tool: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn derive_phases_current_tool_from_running_agent() {
+        let entries: Vec<ProgressEntry> = serde_json::from_str(
+            r#"[
+                {"type":"workflow_phase","index":1,"title":"Build"},
+                {"type":"workflow_agent","index":1,"phaseTitle":"Build","state":"running","lastToolName":"Bash","lastToolSummary":"cargo test --workspace"}
+            ]"#,
+        )
+        .unwrap();
+        let phases = derive_phases(&entries);
+        assert_eq!(
+            phases[0].current_tool.as_deref(),
+            Some("cargo test --workspace")
+        );
+    }
+
+    #[test]
+    fn derive_phases_current_tool_falls_back_to_tool_name() {
+        let entries: Vec<ProgressEntry> = serde_json::from_str(
+            r#"[
+                {"type":"workflow_phase","index":1,"title":"Build"},
+                {"type":"workflow_agent","index":1,"phaseTitle":"Build","state":"running","lastToolName":"Bash"}
+            ]"#,
+        )
+        .unwrap();
+        let phases = derive_phases(&entries);
+        assert_eq!(phases[0].current_tool.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn derive_phases_no_current_tool_when_agent_done() {
+        let entries: Vec<ProgressEntry> = serde_json::from_str(
+            r#"[
+                {"type":"workflow_phase","index":1,"title":"Build"},
+                {"type":"workflow_agent","index":1,"phaseTitle":"Build","state":"done","lastToolName":"Bash","lastToolSummary":"cargo test"}
+            ]"#,
+        )
+        .unwrap();
+        let phases = derive_phases(&entries);
+        assert!(phases[0].current_tool.is_none());
     }
 
     #[test]
@@ -1323,12 +1384,14 @@ mod tests {
                 PhaseProgress {
                     title: "Find".into(),
                     done: 1,
-                    total: 1
+                    total: 1,
+                    current_tool: None,
                 },
                 PhaseProgress {
                     title: "Verify".into(),
                     done: 1,
-                    total: 1
+                    total: 1,
+                    current_tool: None,
                 },
             ]
         );
@@ -1388,12 +1451,14 @@ mod tests {
                 PhaseProgress {
                     title: "Design".into(),
                     done: 1,
-                    total: 1
+                    total: 1,
+                    current_tool: None,
                 },
                 PhaseProgress {
                     title: "Review".into(),
                     done: 0,
-                    total: 1
+                    total: 1,
+                    current_tool: None,
                 },
             ]
         );
@@ -1516,7 +1581,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_subagents_idle_teammate_stale_hidden() {
+    fn scan_subagents_idle_teammate_never_evicted_for_staleness() {
+        // Real Claude Code never evicts idle teammates from its roster —
+        // only terminal rows linger-then-disappear. An idle teammate whose
+        // transcript has gone quiet for a long time must still show, not
+        // vanish, as long as it's genuinely idle (not stale-and-abandoned:
+        // AGENT_STALE_SECS still caps the never-went-idle case elsewhere).
         let dir = tempfile::tempdir().unwrap();
         write_agent_file(
             dir.path(),
@@ -1526,7 +1596,7 @@ mod tests {
         );
         set_mtime_ago(
             &dir.path().join("agent-amy-fixer-782b353b34c66890.jsonl"),
-            TEAMMATE_IDLE_HIDE_SECS + 121,
+            3_600,
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), idle_status())]);
@@ -1538,7 +1608,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         );
-        assert!(agents.is_empty());
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].state, SessionState::Idle);
     }
 
     #[test]
@@ -1655,8 +1726,24 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].task, "Sync agent");
 
-        // tool_result arrived → finished, hidden
+        // tool_result arrived → finished, but lingers briefly first (same
+        // window a workflow run gets) instead of vanishing immediately.
         let completed = HashSet::from(["toolu_123".to_string()]);
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &completed,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+
+        // Quiet past the linger window: hidden.
+        set_mtime_ago(
+            &dir.path().join("agent-sync1.jsonl"),
+            RUN_DONE_LINGER_SECS + 1,
+        );
         let agents = scan_subagents(
             dir.path(),
             &HashSet::new(),
@@ -1690,8 +1777,9 @@ mod tests {
     }
 
     #[test]
-    fn scan_subagents_terminated_teammate_hidden() {
+    fn scan_subagents_terminated_teammate_lingers_then_hidden() {
         let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("agent-amy-fixer-782b353b34c66890.jsonl");
         write_agent_file(
             dir.path(),
             "amy-fixer-782b353b34c66890",
@@ -1705,6 +1793,20 @@ mod tests {
             terminated: true,
         };
         let teammates = HashMap::from([("my-fixer".to_string(), status)]);
+
+        // Fresh: lingers, same as a just-finished workflow run.
+        let agents = scan_subagents(
+            dir.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &teammates,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+
+        // Quiet past the linger window: hidden.
+        set_mtime_ago(&transcript_path, RUN_DONE_LINGER_SECS + 1);
         let agents = scan_subagents(
             dir.path(),
             &HashSet::new(),
@@ -1800,6 +1902,48 @@ mod tests {
         assert!(agents.is_empty());
     }
 
+    #[test]
+    fn workflow_run_freezes_runtime_at_snapshot_duration() {
+        // The agent transcript started long ago — if runtime were still
+        // computed live (now - started_at) it would show a huge number
+        // instead of the run's actual, already-finished duration.
+        let root = tempfile::tempdir().unwrap();
+        let subagents_dir = root.path().join("subagents");
+        let run_dir = subagents_dir.join("workflows").join("wf_done");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(
+            run_dir.join("journal.jsonl"),
+            concat!(
+                "{\"type\":\"started\",\"key\":\"v2:k1\",\"agentId\":\"a1\"}\n",
+                "{\"type\":\"result\",\"key\":\"v2:k1\",\"agentId\":\"a1\",\"result\":\"ok\"}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            run_dir.join("agent-a1.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2020-01-01T00:00:00.000Z\",\"message\":{\"content\":\"go\"}}\n",
+        )
+        .unwrap();
+        let snapshots = root.path().join("workflows");
+        fs::create_dir_all(&snapshots).unwrap();
+        fs::write(
+            snapshots.join("wf_done.json"),
+            r#"{"status":"completed","workflowName":"my-flow","totalTokens":42,"durationMs":125000}"#,
+        )
+        .unwrap();
+
+        let agents = scan_subagents(
+            &subagents_dir,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].runtime_secs, Some(125));
+    }
+
     // ── parse_teammate membership + runtime ──────────────────────
 
     /// Meta + team config fixture: a teammate transcript whose meta names a
@@ -1824,14 +1968,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_teammate_removed_member_hidden() {
+    fn parse_teammate_removed_member_lingers_then_hidden() {
         let dir = tempfile::tempdir().unwrap();
-        // Config readable but our teammate is not a member — terminated
+        // Config readable but our teammate is not a member — terminated.
         let (transcript, teams_dir) = write_teammate_with_team(
             dir.path(),
             r#"{"agentId":"other@session-abc","name":"other","joinedAt":1783569232384}"#,
         );
 
+        // Fresh transcript: still shows, same as a just-finished workflow run.
+        let result = parse_teammate(&transcript, "my-fixer", &spawned_status(), Some(&teams_dir));
+        assert!(result.is_some());
+
+        // Quiet past the linger window: hidden.
+        set_mtime_ago(&transcript, RUN_DONE_LINGER_SECS + 1);
         let result = parse_teammate(&transcript, "my-fixer", &spawned_status(), Some(&teams_dir));
         assert!(result.is_none());
     }
