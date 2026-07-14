@@ -20,10 +20,54 @@ fn contexts_height(sessions: &[SessionData]) -> u16 {
         if has_state_row(session) {
             h = h.saturating_add(1);
         }
-        h = h.saturating_add(session.agents.len() as u16);
+        h = h.saturating_add(agent_row_count(&session.agents) as u16);
         h = h.saturating_add(1); // spacer
     }
     h
+}
+
+/// A named teammate (not a workflow-run aggregate row) sitting idle — the
+/// same rows Claude Code's own picker collapses once there are more than a
+/// few of them.
+fn is_idle_teammate(agent: &SubagentData) -> bool {
+    agent.progress.is_none() && agent.name.is_some() && agent.state == SessionState::Idle
+}
+
+/// Beyond this many idle teammates, collapse them into a single "N idle"
+/// summary row instead of listing each one — mirrors Claude Code's roster,
+/// which does the same once idle teammates stop fitting comfortably.
+const IDLE_TEAMMATE_COLLAPSE_THRESHOLD: usize = 3;
+
+/// How many roster rows `agents` renders as, after idle-teammate collapsing.
+fn agent_row_count(agents: &[SubagentData]) -> usize {
+    let idle_teammates = agents.iter().filter(|a| is_idle_teammate(a)).count();
+    if idle_teammates > IDLE_TEAMMATE_COLLAPSE_THRESHOLD {
+        agents.len() - idle_teammates + 1
+    } else {
+        agents.len()
+    }
+}
+
+enum AgentRow<'a> {
+    Single(&'a SubagentData),
+    CollapsedIdle(usize),
+}
+
+/// Plan the roster rows for `agents`: every agent as its own row, unless
+/// idle teammates outnumber `IDLE_TEAMMATE_COLLAPSE_THRESHOLD`, in which case
+/// they're pulled out into one trailing `CollapsedIdle` row.
+fn plan_agent_rows(agents: &[SubagentData]) -> Vec<AgentRow<'_>> {
+    let idle_teammates = agents.iter().filter(|a| is_idle_teammate(a)).count();
+    if idle_teammates <= IDLE_TEAMMATE_COLLAPSE_THRESHOLD {
+        return agents.iter().map(AgentRow::Single).collect();
+    }
+    let mut rows: Vec<AgentRow<'_>> = agents
+        .iter()
+        .filter(|a| !is_idle_teammate(a))
+        .map(AgentRow::Single)
+        .collect();
+    rows.push(AgentRow::CollapsedIdle(idle_teammates));
+    rows
 }
 
 /// Whether the session gets a state row. An empty state row would render as
@@ -214,7 +258,7 @@ impl Section for ContextsSection<'_> {
             if has_state_row(session) {
                 constraints.push(Constraint::Length(1)); // state
             }
-            for _ in &session.agents {
+            for _ in 0..agent_row_count(&session.agents) {
                 constraints.push(Constraint::Length(1));
             }
             constraints.push(Constraint::Length(1)); // spacer
@@ -359,11 +403,35 @@ fn agent_indent(r: Rect) -> Rect {
 }
 
 fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect], i: &mut usize) {
-    for (idx, agent) in agents.iter().enumerate() {
+    let rows = plan_agent_rows(agents);
+    let total = rows.len();
+    for (idx, row) in rows.into_iter().enumerate() {
         let Some(&area) = chunks.get(*i) else {
             return;
         };
-        let connector = tree_connector(idx + 1 == agents.len());
+        let is_last = idx + 1 == total;
+        match row {
+            AgentRow::Single(agent) => render_agent_row(agent, is_last, frame, area),
+            AgentRow::CollapsedIdle(count) => {
+                render_collapsed_idle_row(count, is_last, frame, area);
+            }
+        }
+        *i += 1;
+    }
+}
+
+fn render_collapsed_idle_row(count: usize, is_last: bool, frame: &mut Frame<'_>, area: Rect) {
+    let connector = tree_connector(is_last);
+    let line = Line::from(vec![
+        Span::styled(connector, Style::default().fg(DIM)),
+        Span::styled(format!("{count} idle"), Style::default().fg(DIM)),
+    ]);
+    frame.render_widget(Paragraph::new(line), agent_indent(area));
+}
+
+fn render_agent_row(agent: &SubagentData, is_last: bool, frame: &mut Frame<'_>, area: Rect) {
+    {
+        let connector = tree_connector(is_last);
         let mut spans = vec![Span::styled(connector, Style::default().fg(DIM))];
         if let Some(name) = &agent.name {
             spans.push(Span::styled(
@@ -426,7 +494,6 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
             ));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), agent_indent(area));
-        *i += 1;
     }
 }
 
@@ -502,6 +569,14 @@ mod tests {
         ];
         // 2 + (4+0+1) + (4+1+1) = 2 + 5 + 6 = 13
         assert_eq!(contexts_height(&sessions), 13);
+    }
+
+    #[test]
+    fn contexts_height_collapses_idle_teammates() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = (0..4).map(|i| idle_teammate(&format!("t{i}"))).collect();
+        // 2 (header+blank) + 4 (title+bar+info+state) + 1 collapsed row + 1 spacer = 8
+        assert_eq!(contexts_height(&[session]), 8);
     }
 
     // ── session_indicator ────────────────────────────────────
@@ -604,6 +679,54 @@ mod tests {
             progress,
             phases: Vec::new(),
         }
+    }
+
+    fn idle_teammate(name: &str) -> SubagentData {
+        SubagentData {
+            task: String::new(),
+            name: Some(name.into()),
+            model: ModelShort::Sonnet,
+            context_tokens: 0,
+            runtime_secs: None,
+            last_write_age_secs: 0,
+            state: SessionState::Idle,
+            progress: None,
+            phases: Vec::new(),
+        }
+    }
+
+    // ── idle-teammate collapsing ─────────────────────────────
+
+    #[test]
+    fn agent_row_count_no_collapse_at_threshold() {
+        let agents: Vec<_> = (0..3).map(|i| idle_teammate(&format!("t{i}"))).collect();
+        assert_eq!(agent_row_count(&agents), 3);
+    }
+
+    #[test]
+    fn agent_row_count_collapses_past_threshold() {
+        let agents: Vec<_> = (0..4).map(|i| idle_teammate(&format!("t{i}"))).collect();
+        assert_eq!(agent_row_count(&agents), 1);
+    }
+
+    #[test]
+    fn agent_row_count_collapse_keeps_non_idle_rows() {
+        let mut agents: Vec<_> = (0..4).map(|i| idle_teammate(&format!("t{i}"))).collect();
+        agents.push(agent_row(None)); // Working, no name — not an idle teammate
+        assert_eq!(agent_row_count(&agents), 2); // 1 collapsed + 1 kept
+    }
+
+    #[test]
+    fn agent_row_count_workflow_rows_never_collapse() {
+        // progress.is_some() excludes workflow-aggregate rows even when
+        // named and terminal (Idle).
+        let agents: Vec<_> = (0..5)
+            .map(|i| SubagentData {
+                progress: Some((2, 2)),
+                ..idle_teammate(&format!("wf{i}"))
+            })
+            .collect();
+        assert_eq!(agent_row_count(&agents), 5);
     }
 
     fn phase(title: &str, done: u32, total: u32) -> PhaseProgress {
@@ -956,6 +1079,53 @@ mod tests {
         assert!(text.contains("├ sonnet working — test"));
         assert!(text.contains("└ sonnet working — test"));
         assert!(text.contains("2 agents"));
+    }
+
+    #[test]
+    fn render_idle_teammates_not_collapsed_at_threshold() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = (0..3)
+            .map(|i| idle_teammate(&format!("teammate-{i}")))
+            .collect();
+        let text = render_to_text(&[session], 100, 14);
+        assert!(text.contains("teammate-0"));
+        assert!(text.contains("teammate-1"));
+        assert!(text.contains("teammate-2"));
+    }
+
+    #[test]
+    fn render_idle_teammates_collapse_past_threshold() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = (0..4)
+            .map(|i| idle_teammate(&format!("teammate-{i}")))
+            .collect();
+        let text = render_to_text(&[session], 100, 14);
+        assert!(text.contains("\u{2514} 4 idle")); // last row: "└ 4 idle"
+        assert!(!text.contains("teammate-0"));
+        assert!(!text.contains("teammate-3"));
+    }
+
+    #[test]
+    fn render_collapse_keeps_non_idle_rows_visible() {
+        let mut session = make_session(0, SessionState::Working);
+        let mut agents: Vec<_> = (0..4)
+            .map(|i| idle_teammate(&format!("teammate-{i}")))
+            .collect();
+        agents.push(SubagentData {
+            task: "Fix things".into(),
+            name: Some("active-one".into()),
+            model: ModelShort::Opus,
+            context_tokens: 1_000,
+            runtime_secs: Some(60),
+            last_write_age_secs: 0,
+            state: SessionState::Working,
+            progress: None,
+            phases: Vec::new(),
+        });
+        session.agents = agents;
+        let text = render_to_text(&[session], 100, 14);
+        assert!(text.contains("active-one"));
+        assert!(text.contains("4 idle"));
     }
 
     #[test]
