@@ -132,16 +132,16 @@ fn format_runtime(secs: u64) -> String {
     }
 }
 
-/// A session whose file has gone quiet far longer than any real model turn
+/// A row whose transcript has gone quiet far longer than any real model turn
 /// can't honestly claim `Working`/`Thinking` — its process likely died or
-/// hung. Same threshold and reasoning as `agent_state_display` already uses
-/// for subagent rows, applied here to the top-level session row too.
+/// hung. Shared by the top-level session row and every subagent row.
+fn is_stale_display(state: SessionState, last_write_age_secs: u64) -> bool {
+    last_write_age_secs > AGENT_STALE_DISPLAY_SECS
+        && matches!(state, SessionState::Working | SessionState::Thinking)
+}
+
 fn session_stale(session: &SessionData) -> bool {
-    session.last_write_age_secs > AGENT_STALE_DISPLAY_SECS
-        && matches!(
-            session.state,
-            SessionState::Working | SessionState::Thinking
-        )
+    is_stale_display(session.state, session.last_write_age_secs)
 }
 
 fn session_indicator(state: SessionState, is_stale: bool, tick: u64) -> (String, Color) {
@@ -191,9 +191,7 @@ fn state_color(state: SessionState) -> Color {
 const AGENT_STALE_DISPLAY_SECS: u64 = 300;
 
 fn agent_state_display(state: SessionState, last_write_age_secs: u64) -> (&'static str, Color) {
-    if last_write_age_secs > AGENT_STALE_DISPLAY_SECS
-        && matches!(state, SessionState::Working | SessionState::Thinking)
-    {
+    if is_stale_display(state, last_write_age_secs) {
         return ("stale", DIM);
     }
     match state {
@@ -295,7 +293,7 @@ impl Section for ContextsSection<'_> {
                 }
                 i += 1;
             }
-            render_agents(&session.agents, frame, &chunks, &mut i);
+            render_agents(&session.agents, self.tick, frame, &chunks, &mut i);
             i += 1; // spacer
         }
     }
@@ -402,7 +400,13 @@ fn agent_indent(r: Rect) -> Rect {
         .split(r)[1]
 }
 
-fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect], i: &mut usize) {
+fn render_agents(
+    agents: &[SubagentData],
+    tick: u64,
+    frame: &mut Frame<'_>,
+    chunks: &[Rect],
+    i: &mut usize,
+) {
     let rows = plan_agent_rows(agents);
     let total = rows.len();
     for (idx, row) in rows.into_iter().enumerate() {
@@ -411,28 +415,47 @@ fn render_agents(agents: &[SubagentData], frame: &mut Frame<'_>, chunks: &[Rect]
         };
         let is_last = idx + 1 == total;
         match row {
-            AgentRow::Single(agent) => render_agent_row(agent, is_last, frame, area),
+            AgentRow::Single(agent) => render_agent_row(agent, tick, is_last, frame, area),
             AgentRow::CollapsedIdle(count) => {
-                render_collapsed_idle_row(count, is_last, frame, area);
+                render_collapsed_idle_row(count, tick, is_last, frame, area);
             }
         }
         *i += 1;
     }
 }
 
-fn render_collapsed_idle_row(count: usize, is_last: bool, frame: &mut Frame<'_>, area: Rect) {
+fn render_collapsed_idle_row(
+    count: usize,
+    tick: u64,
+    is_last: bool,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
     let connector = tree_connector(is_last);
+    let (glyph, glyph_color) = session_indicator(SessionState::Idle, false, tick);
     let line = Line::from(vec![
         Span::styled(connector, Style::default().fg(DIM)),
+        Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
         Span::styled(format!("{count} idle"), Style::default().fg(DIM)),
     ]);
     frame.render_widget(Paragraph::new(line), agent_indent(area));
 }
 
-fn render_agent_row(agent: &SubagentData, is_last: bool, frame: &mut Frame<'_>, area: Rect) {
+fn render_agent_row(
+    agent: &SubagentData,
+    tick: u64,
+    is_last: bool,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
     {
         let connector = tree_connector(is_last);
-        let mut spans = vec![Span::styled(connector, Style::default().fg(DIM))];
+        let stale = is_stale_display(agent.state, agent.last_write_age_secs);
+        let (glyph, glyph_color) = session_indicator(agent.state, stale, tick);
+        let mut spans = vec![
+            Span::styled(connector, Style::default().fg(DIM)),
+            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+        ];
         if let Some(name) = &agent.name {
             spans.push(Span::styled(
                 format!("{name} "),
@@ -930,7 +953,7 @@ mod tests {
         }];
         let text = render_to_text(&[session], 100, 12);
         assert!(text.contains("1 agent"));
-        assert!(text.contains("└ my-fixer opus working — Fix things · 12m 42s · ↓5.0k"));
+        assert!(text.contains("└ ⠋ my-fixer opus working — Fix things · 12m 42s · ↓5.0k"));
     }
 
     #[test]
@@ -949,7 +972,7 @@ mod tests {
         }];
         let text = render_to_text(&[session], 100, 12);
         assert!(text.contains("1 workflow"));
-        assert!(text.contains("└ my-flow 1/2 agents done · 41m 58s · ↓305.8k"));
+        assert!(text.contains("└ ⠋ my-flow 1/2 agents done · 41m 58s · ↓305.8k"));
     }
 
     #[test]
@@ -1033,6 +1056,37 @@ mod tests {
     }
 
     #[test]
+    fn render_agent_row_glyph_reflects_working_state() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![agent_row(None)];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("⠋ sonnet working"));
+    }
+
+    #[test]
+    fn render_agent_row_glyph_idle_shows_circle() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            state: SessionState::Idle,
+            ..agent_row(None)
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("○ sonnet idle"));
+    }
+
+    #[test]
+    fn render_agent_row_glyph_stale_shows_dim_circle_not_spinner() {
+        let mut session = make_session(0, SessionState::Working);
+        session.agents = vec![SubagentData {
+            last_write_age_secs: AGENT_STALE_DISPLAY_SECS + 1,
+            ..agent_row(None)
+        }];
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("○ sonnet stale"));
+        assert!(!text.contains("⠋ sonnet"));
+    }
+
+    #[test]
     fn render_stale_agent_state() {
         let mut session = make_session(0, SessionState::Working);
         session.agents = vec![SubagentData {
@@ -1076,8 +1130,8 @@ mod tests {
     fn render_multiple_agents_use_tree_connectors() {
         let session = make_session(2, SessionState::Working);
         let text = render_to_text(&[session], 100, 12);
-        assert!(text.contains("├ sonnet working — test"));
-        assert!(text.contains("└ sonnet working — test"));
+        assert!(text.contains("├ ⠋ sonnet working — test"));
+        assert!(text.contains("└ ⠋ sonnet working — test"));
         assert!(text.contains("2 agents"));
     }
 
@@ -1100,7 +1154,7 @@ mod tests {
             .map(|i| idle_teammate(&format!("teammate-{i}")))
             .collect();
         let text = render_to_text(&[session], 100, 14);
-        assert!(text.contains("\u{2514} 4 idle")); // last row: "└ 4 idle"
+        assert!(text.contains("\u{2514} \u{25cb} 4 idle")); // last row: "└ ○ 4 idle"
         assert!(!text.contains("teammate-0"));
         assert!(!text.contains("teammate-3"));
     }
