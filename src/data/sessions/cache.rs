@@ -290,6 +290,21 @@ impl SessionCache {
                 .as_deref()
                 .and_then(|root| tasks::activity_for_task_id(root, session_id, &task_id))
                 .unwrap_or_else(|| "TaskUpdate".to_string()),
+            // A turn just finished — show a transient "done in Xm Ys" line
+            // instead of going straight to a blank idle row, but only while
+            // it's still recent (same linger window a finished workflow run
+            // or agent row gets); a session that's genuinely been idle for a
+            // while shows nothing, same as before this existed.
+            activity::Activity::Done { duration_ms } => {
+                if age_secs <= subagents::RUN_DONE_LINGER_SECS {
+                    format!(
+                        "done in {}",
+                        crate::fmt::format_duration(duration_ms.cast_signed() / 1000)
+                    )
+                } else {
+                    String::new()
+                }
+            }
         };
         // A shared TaskList's activeForm — the same text Claude Code's own
         // status header prefers over a decorative verb — takes priority
@@ -359,6 +374,7 @@ impl SessionCache {
             state: session_state,
             activity: act,
             turn_runtime_secs,
+            last_write_age_secs: age_secs,
         })
     }
 
@@ -1230,6 +1246,7 @@ mod tests {
             state: SessionState::Idle,
             activity: String::new(),
             turn_runtime_secs: None,
+            last_write_age_secs: 0,
         }
     }
 

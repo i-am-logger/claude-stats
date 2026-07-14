@@ -20,7 +20,17 @@ use std::fs;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Activity {
     Text(String),
-    PendingTaskUpdate { task_id: String },
+    PendingTaskUpdate {
+        task_id: String,
+    },
+    /// The session just went idle because its last turn finished — a
+    /// `system`/`turn_duration` entry, carrying how long that turn took.
+    /// The caller decides whether it's recent enough to still be worth
+    /// showing (this module has no clock/"now" access) before falling back
+    /// to a blank idle row.
+    Done {
+        duration_ms: u64,
+    },
 }
 
 /// Classification of JSONL line types. State-indicating lines (Progress,
@@ -43,6 +53,17 @@ fn classify_line(val: &Value) -> LineKind {
         Some("user") => LineKind::User,
         _ => LineKind::Metadata,
     }
+}
+
+/// `durationMs` of a `system`/`turn_duration` entry — `None` for any other
+/// line shape.
+fn turn_duration_ms(val: &Value) -> Option<u64> {
+    if val.get("type").and_then(|t| t.as_str()) != Some("system")
+        || val.get("subtype").and_then(|s| s.as_str()) != Some("turn_duration")
+    {
+        return None;
+    }
+    val.get("durationMs").and_then(Value::as_u64)
 }
 
 fn state_from_json(val: &Value) -> SessionState {
@@ -105,7 +126,11 @@ pub fn detect_state_and_activity(lines: &VecDeque<String>) -> (SessionState, Act
     let activity = match state {
         SessionState::Thinking => Activity::Text("thinking...".to_string()),
         SessionState::Working => extract_activity_from_parsed(&parsed),
-        SessionState::Idle => Activity::Text(String::new()),
+        SessionState::Idle => state_entry
+            .and_then(turn_duration_ms)
+            .map_or(Activity::Text(String::new()), |duration_ms| {
+                Activity::Done { duration_ms }
+            }),
     };
 
     (state, activity)
@@ -456,6 +481,45 @@ mod tests {
     fn state_metadata_is_idle() {
         let val = json!({"type": "tag", "value": "test"});
         assert_eq!(state_from_json(&val), SessionState::Idle);
+    }
+
+    // ── detect_state_and_activity: turn_duration → Done ─────────────
+
+    #[test]
+    fn detect_state_and_activity_turn_duration_is_done() {
+        let lines: VecDeque<String> = VecDeque::from([
+            json!({"type": "system", "subtype": "turn_duration", "durationMs": 135_000})
+                .to_string(),
+        ]);
+        let (state, activity) = detect_state_and_activity(&lines);
+        assert_eq!(state, SessionState::Idle);
+        assert_eq!(
+            activity,
+            Activity::Done {
+                duration_ms: 135_000
+            }
+        );
+    }
+
+    #[test]
+    fn detect_state_and_activity_plain_idle_has_no_done() {
+        let lines: VecDeque<String> =
+            VecDeque::from([json!({"type": "system", "subtype": "init"}).to_string()]);
+        let (state, activity) = detect_state_and_activity(&lines);
+        assert_eq!(state, SessionState::Idle);
+        assert_eq!(activity, Activity::Text(String::new()));
+    }
+
+    #[test]
+    fn turn_duration_ms_rejects_other_subtypes() {
+        let val = json!({"type": "system", "subtype": "init", "durationMs": 5000});
+        assert_eq!(turn_duration_ms(&val), None);
+    }
+
+    #[test]
+    fn turn_duration_ms_missing_field() {
+        let val = json!({"type": "system", "subtype": "turn_duration"});
+        assert_eq!(turn_duration_ms(&val), None);
     }
 
     // ── extract_activity ───────────────────────────────────────────

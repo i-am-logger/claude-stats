@@ -88,7 +88,22 @@ fn format_runtime(secs: u64) -> String {
     }
 }
 
-fn session_indicator(state: SessionState, tick: u64) -> (String, Color) {
+/// A session whose file has gone quiet far longer than any real model turn
+/// can't honestly claim `Working`/`Thinking` — its process likely died or
+/// hung. Same threshold and reasoning as `agent_state_display` already uses
+/// for subagent rows, applied here to the top-level session row too.
+fn session_stale(session: &SessionData) -> bool {
+    session.last_write_age_secs > AGENT_STALE_DISPLAY_SECS
+        && matches!(
+            session.state,
+            SessionState::Working | SessionState::Thinking
+        )
+}
+
+fn session_indicator(state: SessionState, is_stale: bool, tick: u64) -> (String, Color) {
+    if is_stale {
+        return ("\u{25cb}".to_string(), DIM); // ○ — can't honestly claim active
+    }
     match state {
         SessionState::Thinking | SessionState::Working => {
             let frame_idx = (tick as usize) % SPINNER.len();
@@ -248,7 +263,8 @@ fn render_title_row(session: &SessionData, tick: u64, frame: &mut Frame<'_>, are
     let tokens_k = format_tokens_k(session.context_tokens);
     let limit_k = format_limit_k(session.context_window);
 
-    let (indicator, indicator_color) = session_indicator(session.state, tick);
+    let (indicator, indicator_color) =
+        session_indicator(session.state, session_stale(session), tick);
 
     let row = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -293,10 +309,23 @@ fn render_info_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_state_row(session: &SessionData, frame: &mut Frame<'_>, area: Rect) {
-    let sc = state_color(session.state);
+    let stale = session_stale(session);
+    let sc = if stale {
+        DIM
+    } else {
+        state_color(session.state)
+    };
     let mut spans = Vec::new();
     if !session.activity.is_empty() {
-        spans.push(Span::styled(&session.activity, Style::default().fg(sc)));
+        // Keep the last-known activity text (still informative — what it
+        // was doing before going quiet) but mark it as possibly outdated,
+        // same as agent_state_display does for subagent rows.
+        let text = if stale {
+            format!("{} (stale)", session.activity)
+        } else {
+            session.activity.clone()
+        };
+        spans.push(Span::styled(text, Style::default().fg(sc)));
         if let Some(runtime) = session.turn_runtime_secs {
             spans.push(Span::styled(
                 format!(" · {}", format_runtime(runtime)),
@@ -431,6 +460,7 @@ mod tests {
             state,
             activity: "Bash(ls)".into(),
             turn_runtime_secs: None,
+            last_write_age_secs: 0,
         }
     }
 
@@ -478,29 +508,36 @@ mod tests {
 
     #[test]
     fn session_indicator_idle() {
-        let (icon, color) = session_indicator(SessionState::Idle, 0);
+        let (icon, color) = session_indicator(SessionState::Idle, false, 0);
         assert_eq!(icon, "\u{25cb}");
         assert_eq!(color, DIM);
     }
 
     #[test]
     fn session_indicator_thinking() {
-        let (icon, color) = session_indicator(SessionState::Thinking, 0);
+        let (icon, color) = session_indicator(SessionState::Thinking, false, 0);
         assert_eq!(icon, SPINNER[0].to_string());
         assert_eq!(color, Color::Cyan);
     }
 
     #[test]
     fn session_indicator_working() {
-        let (_, color) = session_indicator(SessionState::Working, 0);
+        let (_, color) = session_indicator(SessionState::Working, false, 0);
         assert_eq!(color, Color::Green);
     }
 
     #[test]
     fn session_indicator_spinner_wraps() {
-        let (icon1, _) = session_indicator(SessionState::Thinking, 0);
-        let (icon2, _) = session_indicator(SessionState::Thinking, SPINNER.len() as u64);
+        let (icon1, _) = session_indicator(SessionState::Thinking, false, 0);
+        let (icon2, _) = session_indicator(SessionState::Thinking, false, SPINNER.len() as u64);
         assert_eq!(icon1, icon2);
+    }
+
+    #[test]
+    fn session_indicator_stale_shows_idle_circle() {
+        let (icon, color) = session_indicator(SessionState::Working, true, 0);
+        assert_eq!(icon, "\u{25cb}");
+        assert_eq!(color, DIM);
     }
 
     // ── format functions ─────────────────────────────────────
@@ -890,6 +927,26 @@ mod tests {
         assert!(text.contains("sonnet stale — Quiet work"));
         // No runtime span when the start time is unknown
         assert!(!text.contains(" · ↓1.0k · "));
+    }
+
+    #[test]
+    fn render_stale_session_marked_and_shows_idle_circle() {
+        let mut session = make_session(0, SessionState::Working);
+        session.activity = "Bash(cargo build)".into();
+        session.last_write_age_secs = AGENT_STALE_DISPLAY_SECS + 1;
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("Bash(cargo build) (stale)"));
+        assert!(text.contains("○ test"));
+    }
+
+    #[test]
+    fn render_fresh_working_session_not_marked_stale() {
+        let mut session = make_session(0, SessionState::Working);
+        session.activity = "Bash(cargo build)".into();
+        session.last_write_age_secs = 5;
+        let text = render_to_text(&[session], 100, 12);
+        assert!(text.contains("Bash(cargo build)"));
+        assert!(!text.contains("(stale)"));
     }
 
     #[test]

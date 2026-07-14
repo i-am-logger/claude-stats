@@ -108,4 +108,9 @@ pub struct SessionData {
     /// entry) — "time in the current turn", the same semantics already used
     /// for subagent/teammate rows. `None` when idle or unknown.
     pub turn_runtime_secs: Option<u64>,
+    /// Seconds since the session file was last modified. Used to downgrade a
+    /// `Working`/`Thinking` display to "stale" when the process has gone
+    /// quiet far longer than any real model turn — the same staleness
+    /// pattern already used for subagent rows (`agent_state_display`).
+    pub last_write_age_secs: u64,
 }
