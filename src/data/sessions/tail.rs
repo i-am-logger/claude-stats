@@ -69,17 +69,6 @@ pub struct TeammateStatus {
     pub terminated: bool,
 }
 
-impl TeammateStatus {
-    /// Whether the teammate has gone idle since its last spawn.
-    pub fn is_idle(&self) -> bool {
-        match (self.spawned_at, self.last_idle_at) {
-            (Some(spawned), Some(idle)) => idle > spawned,
-            (None, Some(_)) => true,
-            _ => false,
-        }
-    }
-}
-
 /// Parse the top-level `.timestamp` field of a session entry.
 pub(crate) fn entry_timestamp(val: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
     let ts = val.get("timestamp")?.as_str()?;
@@ -1235,7 +1224,7 @@ mod tests {
         ));
         let status = &tracker.teammates()["fix-docrefs"];
         assert!(status.spawned_at.is_some());
-        assert!(!status.is_idle());
+        assert!(status.last_idle_at.is_none());
     }
 
     #[test]
@@ -1249,7 +1238,7 @@ mod tests {
             "fix-docrefs",
             "2026-07-09T02:07:22.456Z",
         ));
-        assert!(tracker.teammates()["fix-docrefs"].is_idle());
+        assert!(tracker.teammates()["fix-docrefs"].last_idle_at.is_some());
     }
 
     #[test]
@@ -1274,9 +1263,9 @@ mod tests {
             "message": {"content": batched_content}
         }));
 
-        assert!(tracker.teammates()["angle1"].is_idle());
-        assert!(tracker.teammates()["angle2"].is_idle());
-        assert!(tracker.teammates()["angle3"].is_idle());
+        assert!(tracker.teammates()["angle1"].last_idle_at.is_some());
+        assert!(tracker.teammates()["angle2"].last_idle_at.is_some());
+        assert!(tracker.teammates()["angle3"].last_idle_at.is_some());
     }
 
     #[test]
@@ -1294,7 +1283,8 @@ mod tests {
             "fix-docrefs",
             "2026-07-09T02:10:00.000Z",
         ));
-        assert!(!tracker.teammates()["fix-docrefs"].is_idle());
+        let status = &tracker.teammates()["fix-docrefs"];
+        assert!(status.spawned_at > status.last_idle_at);
     }
 
     #[test]
@@ -1312,7 +1302,7 @@ mod tests {
             "2026-07-09T02:00:48.994Z",
         ));
         tracker.process(&val);
-        assert!(!tracker.teammates()["fix-docrefs"].is_idle());
+        assert!(tracker.teammates()["fix-docrefs"].last_idle_at.is_none());
     }
 
     #[test]
@@ -1328,7 +1318,7 @@ mod tests {
             "2026-07-09T02:07:22.456Z",
         ));
         a.merge(&b);
-        assert!(a.teammates()["fix-docrefs"].is_idle());
+        assert!(a.teammates()["fix-docrefs"].last_idle_at.is_some());
     }
 
     #[test]
@@ -1523,16 +1513,6 @@ mod tests {
     }
 
     #[test]
-    fn teammate_idle_without_spawn_counts_as_idle() {
-        let status = TeammateStatus {
-            spawned_at: None,
-            last_idle_at: Some(chrono::Utc::now()),
-            terminated: false,
-        };
-        assert!(status.is_idle());
-    }
-
-    #[test]
     fn tracker_teammate_idle_in_array_content() {
         let val = serde_json::json!({
             "type": "user",
@@ -1549,7 +1529,7 @@ mod tests {
             "2026-07-09T02:00:48.994Z",
         ));
         tracker.process(&val);
-        assert!(tracker.teammates()["fix-docrefs"].is_idle());
+        assert!(tracker.teammates()["fix-docrefs"].last_idle_at.is_some());
     }
 
     #[test]
@@ -1574,7 +1554,8 @@ mod tests {
             "fix-docrefs",
             "2026-07-09T02:07:00.000Z",
         ));
-        assert!(!tracker.teammates()["fix-docrefs"].is_idle());
+        let status = &tracker.teammates()["fix-docrefs"];
+        assert!(status.spawned_at > status.last_idle_at);
     }
 
     #[test]

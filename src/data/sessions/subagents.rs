@@ -194,26 +194,26 @@ fn parse_teammate(
         return (data.last_write_age_secs <= RUN_DONE_LINGER_SECS).then_some(data);
     }
 
-    if status.is_idle() && data.state == SessionState::Idle {
-        // Idle means "available", not terminated. Real Claude Code never
-        // evicts idle teammates from its roster — only terminal rows linger-
-        // then-disappear — so an idle teammate whose transcript is still on
-        // disk keeps showing indefinitely, same as CC's own picker.
-    } else if data.last_write_age_secs > AGENT_STALE_SECS {
-        // Either genuinely active (never sent an idle notification, or the
-        // transcript tail shows fresh work — see below), or a stale/absent
-        // idle signal and the transcript has been quiet far longer than any
-        // real model turn — abandoned or killed.
+    // Idle means "available", not terminated — a genuinely idle teammate
+    // isn't evicted the instant it stops writing, unlike a crashed/killed
+    // one. But it isn't immortal either: live cross-checking against real
+    // Claude Code's own roster shows it stops listing teammates that have
+    // sat idle for a long time (observed: one-off research teammates idle
+    // for hours no longer appear), even though their team-config membership
+    // and on-disk transcript persist indefinitely. `AGENT_STALE_SECS` is
+    // reused here for consistency with the "presumed dead" bound already
+    // used elsewhere — same threshold, same "hasn't been touched in far
+    // longer than any real model turn or normal between-turns gap" logic.
+    if data.last_write_age_secs > AGENT_STALE_SECS {
         return None;
     }
-    // Deliberately NOT forcing `data.state = Idle` when `status.is_idle()` is
-    // true but the transcript tail (`detect_state_from_tail`, already
-    // computed into `data.state` by `parse_subagent` above) disagrees:
-    // `idle_notification` delivery into the parent JSONL can lag minutes
-    // behind (it only lands once the lead itself goes idle), so a teammate
-    // that resumed via a new mailbox message and is actively mid-turn right
-    // now can still be carrying a stale `is_idle()==true` latch — the
-    // transcript tail is the fresher, more reliable signal in that case.
+    // `data.state` already reflects the transcript tail directly
+    // (`detect_state_from_tail`, computed by `parse_subagent` above) and is
+    // never overridden here: `idle_notification` delivery into the parent
+    // JSONL can lag minutes behind (it only lands once the lead itself goes
+    // idle), so a teammate that resumed via a new mailbox message and is
+    // actively mid-turn right now needs the transcript's own fresher signal,
+    // not a stale idle latch derived from the parent JSONL.
     // The meta.json name wins, but the tracker name fills any gap.
     data.name.get_or_insert_with(|| name.to_string());
     // Claude Code's roster shows time-in-current-turn: elapsed since the last
@@ -1550,12 +1550,12 @@ mod tests {
 
     #[test]
     fn scan_subagents_idle_teammate_resumed_shows_working() {
-        // The idle_notification latch (`status.is_idle()`) can be stale:
-        // delivery into the parent JSONL only happens once the lead itself
-        // goes idle, so a teammate that resumed via a new mailbox message
-        // and is actively mid-turn right now can still carry a
-        // `is_idle()==true` status. The teammate's OWN transcript tail is
-        // the fresher signal and must win — not get forcibly overwritten.
+        // The idle_notification latch tracked from the parent JSONL can be
+        // stale: delivery only happens once the lead itself goes idle, so a
+        // teammate that resumed via a new mailbox message and is actively
+        // mid-turn right now can still carry a stale idle status. The
+        // teammate's OWN transcript tail is the fresher signal and must
+        // win — not get forcibly overwritten.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-amy-fixer-782b353b34c66890.jsonl");
         fs::write(
@@ -1581,12 +1581,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_subagents_idle_teammate_never_evicted_for_staleness() {
-        // Real Claude Code never evicts idle teammates from its roster —
-        // only terminal rows linger-then-disappear. An idle teammate whose
-        // transcript has gone quiet for a long time must still show, not
-        // vanish, as long as it's genuinely idle (not stale-and-abandoned:
-        // AGENT_STALE_SECS still caps the never-went-idle case elsewhere).
+    fn scan_subagents_idle_teammate_evicted_after_long_staleness() {
+        // Cross-checked live against real Claude Code's own roster: it does
+        // NOT keep showing teammates that have sat idle for hours, even
+        // though their team-config membership and on-disk transcript persist
+        // indefinitely. An idle teammate quiet for far longer than
+        // AGENT_STALE_SECS must be evicted, same as an abandoned one.
         let dir = tempfile::tempdir().unwrap();
         write_agent_file(
             dir.path(),
@@ -1596,7 +1596,7 @@ mod tests {
         );
         set_mtime_ago(
             &dir.path().join("agent-amy-fixer-782b353b34c66890.jsonl"),
-            3_600,
+            AGENT_STALE_SECS + 60,
         );
 
         let teammates = HashMap::from([("my-fixer".to_string(), idle_status())]);
@@ -1608,8 +1608,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
         );
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].state, SessionState::Idle);
+        assert!(agents.is_empty());
     }
 
     #[test]
