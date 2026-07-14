@@ -8,6 +8,7 @@ mod cache;
 mod process;
 pub mod subagents;
 pub mod tail;
+mod tasks;
 #[cfg(test)]
 mod testutil;
 

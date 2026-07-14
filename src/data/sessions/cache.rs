@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use super::{activity, process, subagents, tail, SessionData};
+use super::{activity, process, subagents, tail, tasks, SessionData, SessionState};
 
 /// Sessions modified more than 60s ago are considered inactive and excluded
 /// from the dashboard.
@@ -266,9 +266,24 @@ impl SessionCache {
 
         let (session_state, act) = activity::detect_state_and_activity(&sfr.last_lines);
 
+        let session_id = path.file_stem()?.to_str()?;
+        // A shared TaskList's activeForm — the same text Claude Code's own
+        // status header prefers over a decorative verb — takes priority
+        // over the last-tool-call reconstruction, but only while the
+        // session is actually active (idle sessions show no activity line
+        // at all, matching existing behavior).
+        let act = if session_state == SessionState::Idle {
+            act
+        } else {
+            dirs::home_dir()
+                .and_then(|home| {
+                    tasks::current_task_activity(&home.join(".claude").join("tasks"), session_id)
+                })
+                .unwrap_or(act)
+        };
+
         // Always check for active subagents — background agents keep running
         // even after the parent conversation turn finishes (Idle state).
-        let session_id = path.file_stem()?.to_str()?;
         let subagents_dir = path.parent()?.join(session_id).join("subagents");
         let active_ids = self.update_agent_tracking(path);
         let (completed_tool_ids, teammates, workflow_names, workflow_task_ids) = self
@@ -332,7 +347,6 @@ mod tests {
         assistant_usage_line, async_agent_launch_line, jsonl_file, progress_line,
         queue_operation_complete_line, tool_result_line, workflow_launch_line, write_agent_file,
     };
-    use crate::data::sessions::SessionState;
     use std::io::{Seek, SeekFrom, Write};
 
     // ── scan_session_file (full read) ─────────────────────────────
