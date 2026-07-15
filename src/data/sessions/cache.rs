@@ -11,6 +11,22 @@ use super::{activity, process, subagents, tail, tasks, SessionData, SessionState
 /// from the dashboard.
 const MAX_AGE_SECS: u64 = 60;
 
+/// How often the stand-in decorative verb rotates. Claude Code's own verb
+/// changes on a cadence we can't observe from disk; this just keeps
+/// claude-stats' stand-in from looking frozen without flickering every poll.
+const VERB_ROTATE_SECS: i64 = 4;
+
+/// Seed for `activity::pick_verb`: varies by session identity (so concurrent
+/// sessions don't all show the same word at once) and by a coarse time
+/// bucket (so the word visibly rotates), without needing an RNG dependency.
+fn verb_seed(session_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    (chrono::Utc::now().timestamp() / VERB_ROTATE_SECS).hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Cached computed state for a session file. Stores only the derived values,
 /// not the file content.
 #[derive(Debug)]
@@ -305,6 +321,14 @@ impl SessionCache {
                     String::new()
                 }
             }
+            // No task-list or tool-specific text — same situation Claude
+            // Code's own status header falls back to a decorative random
+            // verb for, picked fresh client-side and never persisted to the
+            // transcript, so the exact live word is unobservable from disk.
+            // `verb_seed` draws a stand-in from the same pool: stable per
+            // session for a few seconds (not flickering every poll), varying
+            // across concurrent sessions (not all showing the same word).
+            activity::Activity::Generic => activity::pick_verb(verb_seed(session_id)).to_string(),
         };
         // A shared TaskList's activeForm — the same text Claude Code's own
         // status header prefers over a decorative verb — takes priority
@@ -397,6 +421,20 @@ mod tests {
         queue_operation_complete_line, tool_result_line, workflow_launch_line, write_agent_file,
     };
     use std::io::{Seek, SeekFrom, Write};
+
+    // ── verb_seed ────────────────────────────────────────────────
+
+    #[test]
+    fn verb_seed_differs_by_session_id() {
+        assert_ne!(verb_seed("session-a"), verb_seed("session-b"));
+    }
+
+    #[test]
+    fn verb_seed_stable_within_rotate_window() {
+        // Same session, called twice in immediate succession, must land in
+        // the same multi-second rotation bucket.
+        assert_eq!(verb_seed("session-a"), verb_seed("session-a"));
+    }
 
     // ── scan_session_file (full read) ─────────────────────────────
 
@@ -718,7 +756,10 @@ mod tests {
         let session = cache.parse_session(f.path(), 2).unwrap();
 
         assert_eq!(session.state, SessionState::Working);
-        assert_eq!(session.activity, "working");
+        // No task-list/TaskCreate text available — a stand-in decorative
+        // verb from the same pool Claude Code's own header draws from (the
+        // literal live word is unobservable from disk; see verb_seed).
+        assert!(activity::RANDOM_VERBS.contains(&session.activity.as_str()));
     }
 
     #[test]
@@ -731,7 +772,7 @@ mod tests {
         let session = cache.parse_session(f.path(), 1).unwrap();
 
         assert_eq!(session.state, SessionState::Thinking);
-        assert_eq!(session.activity, "thinking...");
+        assert!(activity::RANDOM_VERBS.contains(&session.activity.as_str()));
     }
 
     #[test]

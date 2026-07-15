@@ -31,6 +31,219 @@ pub enum Activity {
     Done {
         duration_ms: u64,
     },
+    /// No task-list or tool-specific text available — confirmed via binary
+    /// forensics that this is exactly when Claude Code's own status header
+    /// falls back to a decorative random verb (`Improvising…`,
+    /// `Percolating…`, `Puzzling…`, ...), picked fresh client-side and never
+    /// written to the transcript. This module has no clock/"now" access (see
+    /// module docs), so the caller picks the actual word via `pick_verb`.
+    Generic,
+}
+
+/// Claude Code's own decorative status-header verb pool, extracted directly
+/// from the compiled `claude` binary (`libexec/claude-code/claude`, string
+/// table adjacent to the `randomVerb` fallback in its status-header priority
+/// chain `overrideMessage ?? activeForm ?? subject ?? randomVerb`) — the
+/// exact words it shows in place of activeForm/subject text. Claude Code
+/// picks fresh, client-side, on every render; nothing here is ever
+/// persisted to the transcript, so claude-stats can never show the literal
+/// word Claude Code is showing at any given instant — only something drawn
+/// from the same pool, via `pick_verb`.
+pub(crate) const RANDOM_VERBS: &[&str] = &[
+    "Accomplishing",
+    "Actioning",
+    "Actualizing",
+    "Architecting",
+    "Baking",
+    "Beaming",
+    "Beboppin'",
+    "Befuddling",
+    "Billowing",
+    "Blanching",
+    "Bloviating",
+    "Boogieing",
+    "Boondoggling",
+    "Booping",
+    "Bootstrapping",
+    "Brewing",
+    "Bunning",
+    "Burrowing",
+    "Calculating",
+    "Canoodling",
+    "Caramelizing",
+    "Cascading",
+    "Catapulting",
+    "Cerebrating",
+    "Channeling",
+    "Channelling",
+    "Choreographing",
+    "Churning",
+    "Clauding",
+    "Coalescing",
+    "Cogitating",
+    "Combobulating",
+    "Composing",
+    "Computing",
+    "Concocting",
+    "Considering",
+    "Contemplating",
+    "Cooking",
+    "Crafting",
+    "Creating",
+    "Crunching",
+    "Crystallizing",
+    "Cultivating",
+    "Deciphering",
+    "Deliberating",
+    "Determining",
+    "Dilly-dallying",
+    "Discombobulating",
+    "Doing",
+    "Doodling",
+    "Drizzling",
+    "Ebbing",
+    "Effecting",
+    "Elucidating",
+    "Embellishing",
+    "Enchanting",
+    "Envisioning",
+    "Fermenting",
+    "Fiddle-faddling",
+    "Finagling",
+    "Flambéing",
+    "Flibbertigibbeting",
+    "Flowing",
+    "Flummoxing",
+    "Fluttering",
+    "Forging",
+    "Forming",
+    "Frolicking",
+    "Frosting",
+    "Gallivanting",
+    "Galloping",
+    "Garnishing",
+    "Generating",
+    "Gesticulating",
+    "Germinating",
+    "Gitifying",
+    "Grooving",
+    "Gusting",
+    "Harmonizing",
+    "Hashing",
+    "Hatching",
+    "Herding",
+    "Honking",
+    "Hullaballooing",
+    "Hyperspacing",
+    "Ideating",
+    "Imagining",
+    "Improvising",
+    "Incubating",
+    "Inferring",
+    "Infusing",
+    "Ionizing",
+    "Jitterbugging",
+    "Julienning",
+    "Kneading",
+    "Leavening",
+    "Levitating",
+    "Lollygagging",
+    "Manifesting",
+    "Marinating",
+    "Meandering",
+    "Metamorphosing",
+    "Misting",
+    "Moonwalking",
+    "Moseying",
+    "Mulling",
+    "Mustering",
+    "Musing",
+    "Nebulizing",
+    "Nesting",
+    "Newspapering",
+    "Noodling",
+    "Nucleating",
+    "Orbiting",
+    "Orchestrating",
+    "Osmosing",
+    "Perambulating",
+    "Percolating",
+    "Perusing",
+    "Philosophising",
+    "Photosynthesizing",
+    "Pollinating",
+    "Pondering",
+    "Pontificating",
+    "Pouncing",
+    "Precipitating",
+    "Prestidigitating",
+    "Processing",
+    "Proofing",
+    "Propagating",
+    "Puttering",
+    "Puzzling",
+    "Quantumizing",
+    "Razzle-dazzling",
+    "Razzmatazzing",
+    "Recombobulating",
+    "Reticulating",
+    "Roosting",
+    "Ruminating",
+    "Sautéing",
+    "Scampering",
+    "Schlepping",
+    "Scurrying",
+    "Seasoning",
+    "Shenaniganing",
+    "Shimmying",
+    "Simmering",
+    "Skedaddling",
+    "Sketching",
+    "Slithering",
+    "Smooshing",
+    "Sock-hopping",
+    "Spelunking",
+    "Spinning",
+    "Sprouting",
+    "Stewing",
+    "Sublimating",
+    "Swirling",
+    "Swooping",
+    "Symbioting",
+    "Synthesizing",
+    "Tempering",
+    "Thinking",
+    "Thundering",
+    "Tinkering",
+    "Tomfoolering",
+    "Topsy-turvying",
+    "Transfiguring",
+    "Transmuting",
+    "Twisting",
+    "Undulating",
+    "Unfurling",
+    "Unravelling",
+    "Vibing",
+    "Waddling",
+    "Wandering",
+    "Warping",
+    "Whatchamacalliting",
+    "Whirlpooling",
+    "Whirring",
+    "Whisking",
+    "Wibbling",
+    "Working",
+    "Wrangling",
+    "Zesting",
+    "Zigzagging",
+];
+
+/// Pick a verb from `RANDOM_VERBS` for `seed`. Pure and deterministic —
+/// the caller derives `seed` from whatever varies (session identity, a
+/// coarse time bucket) so the same session shows a stable word for a while
+/// and different sessions don't all show the same word at once.
+pub(crate) fn pick_verb(seed: u64) -> &'static str {
+    RANDOM_VERBS[(seed as usize) % RANDOM_VERBS.len()]
 }
 
 /// Classification of JSONL line types. State-indicating lines (Progress,
@@ -124,7 +337,10 @@ pub fn detect_state_and_activity(lines: &VecDeque<String>) -> (SessionState, Act
     let state = state_entry.map_or(SessionState::Idle, state_from_json);
 
     let activity = match state {
-        SessionState::Thinking => Activity::Text("thinking...".to_string()),
+        // Claude Code's status header uses the same randomVerb fallback
+        // while thinking as while working — "Thinking" is just one of the
+        // ~190 words in the pool, not a fixed special case.
+        SessionState::Thinking => Activity::Generic,
         SessionState::Working => extract_activity_from_parsed(&parsed),
         SessionState::Idle => state_entry
             .and_then(turn_duration_ms)
@@ -178,15 +394,15 @@ fn extract_activity_from_parsed(parsed: &[Option<Value>]) -> Activity {
             _ => {}
         }
     }
-    Activity::Text("working".to_string())
+    Activity::Generic
 }
 
 fn extract_tool_names(val: &Value) -> Activity {
     let Some(content) = val.pointer("/message/content") else {
-        return Activity::Text("working".to_string());
+        return Activity::Generic;
     };
     let Some(arr) = content.as_array() else {
-        return Activity::Text("working".to_string());
+        return Activity::Generic;
     };
 
     // A lone TaskUpdate call needs a further shared-TaskList lookup by id —
@@ -222,10 +438,9 @@ fn extract_tool_names(val: &Value) -> Activity {
     tool_uses
         .iter()
         .find(|b| b.get("name").and_then(|n| n.as_str()) == Some("TaskCreate"))
-        .map_or_else(
-            || Activity::Text("working".to_string()),
-            |block| Activity::Text(task_create_text(block)),
-        )
+        .map_or(Activity::Generic, |block| {
+            Activity::Text(task_create_text(block))
+        })
 }
 
 fn task_create_text(block: &Value) -> String {
@@ -240,6 +455,25 @@ fn task_create_text(block: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── pick_verb ─────────────────────────────────────────────────
+
+    #[test]
+    fn pick_verb_returns_word_from_pool() {
+        for seed in [0, 1, 42, 186, 187, 1_000_000, u64::MAX] {
+            assert!(RANDOM_VERBS.contains(&pick_verb(seed)));
+        }
+    }
+
+    #[test]
+    fn pick_verb_deterministic_for_same_seed() {
+        assert_eq!(pick_verb(123), pick_verb(123));
+    }
+
+    #[test]
+    fn pick_verb_wraps_around_pool_length() {
+        assert_eq!(pick_verb(0), pick_verb(RANDOM_VERBS.len() as u64));
+    }
 
     // ── classify_line ──────────────────────────────────────────────
 
@@ -522,14 +756,14 @@ mod tests {
     }
 
     #[test]
-    fn activity_progress_line_alone_falls_back_to_working() {
+    fn activity_progress_line_alone_falls_back_to_generic() {
         let val = json!({
             "type": "progress",
             "data": {"type": "bash_progress", "output": "stuff"}
         });
         assert_eq!(
             extract_activity_from_parsed(&[Some(val)]),
-            Activity::Text("working".to_string())
+            Activity::Generic
         );
     }
 
@@ -552,12 +786,9 @@ mod tests {
     }
 
     #[test]
-    fn activity_fallback_working() {
+    fn activity_fallback_generic() {
         let parsed: Vec<Option<Value>> = vec![None, None];
-        assert_eq!(
-            extract_activity_from_parsed(&parsed),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_activity_from_parsed(&parsed), Activity::Generic);
     }
 
     #[test]
@@ -570,11 +801,11 @@ mod tests {
     }
 
     #[test]
-    fn activity_other_system_subtype_falls_back_to_working() {
+    fn activity_other_system_subtype_falls_back_to_generic() {
         let val = json!({"type": "system", "subtype": "turn_duration"});
         assert_eq!(
             extract_activity_from_parsed(&[Some(val)]),
-            Activity::Text("working".to_string())
+            Activity::Generic
         );
     }
 
@@ -625,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_tool_names_task_update_mixed_with_other_tool_falls_back_to_working() {
+    fn extract_tool_names_task_update_mixed_with_other_tool_falls_back_to_generic() {
         // Not the lone-call shape TaskUpdate usually has — falls through past
         // the by-id lookup, and with no TaskCreate call present either,
         // lands on the generic state word rather than trying to resolve a
@@ -639,10 +870,7 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(
-            extract_tool_names(&val),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_tool_names(&val), Activity::Generic);
     }
 
     #[test]
@@ -663,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_tool_names_task_update_missing_task_id_falls_back_to_working() {
+    fn extract_tool_names_task_update_missing_task_id_falls_back_to_generic() {
         let val = json!({
             "type": "assistant",
             "message": {
@@ -672,14 +900,11 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(
-            extract_tool_names(&val),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_tool_names(&val), Activity::Generic);
     }
 
     #[test]
-    fn extract_tool_names_no_task_create_falls_back_to_working() {
+    fn extract_tool_names_no_task_create_falls_back_to_generic() {
         let val = json!({
             "type": "assistant",
             "message": {
@@ -689,10 +914,7 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(
-            extract_tool_names(&val),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_tool_names(&val), Activity::Generic);
     }
 
     // ── edge cases ─────────────────────────────────────────────────
@@ -737,28 +959,19 @@ mod tests {
     #[test]
     fn extract_activity_all_unparseable() {
         let parsed: Vec<Option<Value>> = vec![None, None, None];
-        assert_eq!(
-            extract_activity_from_parsed(&parsed),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_activity_from_parsed(&parsed), Activity::Generic);
     }
 
     #[test]
     fn extract_activity_empty_input() {
         let parsed: Vec<Option<Value>> = vec![];
-        assert_eq!(
-            extract_activity_from_parsed(&parsed),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_activity_from_parsed(&parsed), Activity::Generic);
     }
 
     #[test]
     fn extract_tool_names_missing_content() {
         let val = json!({"type": "assistant", "message": {}});
-        assert_eq!(
-            extract_tool_names(&val),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_tool_names(&val), Activity::Generic);
     }
 
     #[test]
@@ -767,10 +980,7 @@ mod tests {
             "type": "assistant",
             "message": {"content": []}
         });
-        assert_eq!(
-            extract_tool_names(&val),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_tool_names(&val), Activity::Generic);
     }
 
     #[test]
@@ -779,10 +989,7 @@ mod tests {
             "type": "assistant",
             "message": {"content": [{"type": "text", "text": "hi"}]}
         });
-        assert_eq!(
-            extract_tool_names(&val),
-            Activity::Text("working".to_string())
-        );
+        assert_eq!(extract_tool_names(&val), Activity::Generic);
     }
 
     // ── detect_state_from_tail ────────────────────────────────────
