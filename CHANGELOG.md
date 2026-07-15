@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/i-am-logger/claude-stats/compare/v1.7.0...v1.8.0) (2026-07-15)
+
+
+### Features
+
+* draw activity fallback text from Claude Code's real verb pool ([cf3d6b7](https://github.com/i-am-logger/claude-stats/commit/cf3d6b7ae228d416e2754cd81c5b38bdc45d9ac6))
+
 ## [1.7.0](https://github.com/i-am-logger/claude-stats/compare/v1.6.2...v1.7.0) (2026-07-14)
 
 
